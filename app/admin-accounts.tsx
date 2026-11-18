@@ -7,15 +7,25 @@ import { useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import type { LucideIcon } from 'lucide-react-native';
 import {
+  Activity,
+  Bot,
   Boxes,
   Check,
+  CheckSquare2,
+  ChevronLeft,
   ChevronDown,
+  ChevronRight,
   Clock3,
   CloudCog,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   FileUp,
   Filter,
+  Gauge,
+  History,
+  Layers3,
   LogIn,
   Network,
   Pencil,
@@ -27,16 +37,20 @@ import {
   Save,
   SearchX,
   SlidersHorizontal,
+  Square,
   Trash2,
   Upload,
   Wifi,
+  Wrench,
   X,
+  Zap,
 } from 'lucide-react-native';
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -60,6 +74,7 @@ import {
   accountStatusLabels,
   accountStatusNeedsAttention,
   accountStatusReason,
+  maskAccountIdentity,
   type UpstreamAccountStatus,
 } from '@/src/lib/account-display';
 import { apiFetch, apiJson, firstArray, type ApiResult } from '@/src/lib/api';
@@ -68,15 +83,18 @@ import { queryClient } from '@/src/lib/query-client';
 import { useAppTheme } from '@/src/lib/theme';
 import { useScreenFocus } from '@/src/lib/use-screen-focus';
 import { setAdminAccountEnabled } from '@/src/services/admin';
+import { setPrivacyMode, usePrivacyMode } from '@/src/store/privacy';
 import type { ApiRecord } from '@/src/types/api';
 
 type StatusFilter = 'all' | UpstreamAccountStatus;
-type FilterMode = 'status' | 'provider' | '';
+type FilterMode = 'status' | 'provider' | 'egress' | '';
+type ListMode = 'attention' | 'provider';
 type ModelTestState = { ok: boolean; message: string; testedAt: string };
 type ModelTestProgress = { completed: number; total: number };
 type AccountDraft = {
   label: string;
   priority: string;
+  concurrencyLimit: string;
   status: string;
   egressSelector: string;
   wsEnabled: boolean;
@@ -100,6 +118,8 @@ const credentialFields: Record<string, Array<{ key: string; label: string; place
 };
 
 const statusOrder: UpstreamAccountStatus[] = ['active', 'error', 'needs_reauth', 'suspended', 'rate_limited', 'cooldown', 'disabled'];
+const accountPageSize = 20;
+const maxAccountConcurrency = 10_000;
 
 function stringValue(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
@@ -107,6 +127,134 @@ function stringValue(value: unknown) {
 
 function recordValue(value: unknown): ApiRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as ApiRecord : {};
+}
+
+function arrayFrom(value: unknown, keys: string[]) {
+  if (Array.isArray(value)) return value.filter((item): item is ApiRecord => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
+  const record = recordValue(value);
+  for (const key of keys) {
+    if (Array.isArray(record[key])) return (record[key] as unknown[]).filter((item): item is ApiRecord => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
+  }
+  return [];
+}
+
+function nestedNumber(item: ApiRecord | undefined, keys: string[]) {
+  if (!item) return undefined;
+  const queue = [item];
+  const seen = new Set<ApiRecord>();
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    for (const key of keys) {
+      const value = Number(current[key]);
+      if (Number.isFinite(value)) return value;
+    }
+    for (const key of ['quota', 'usage', 'limits', 'billing', 'metadata']) {
+      const nested = recordValue(current[key]);
+      if (Object.keys(nested).length) queue.push(nested);
+    }
+  }
+  return undefined;
+}
+
+function quotaAccounts(payload: unknown) {
+  const root = recordValue(payload);
+  const direct = arrayFrom(root, ['accounts', 'items']);
+  const groups = arrayFrom(root, ['groups', 'providers']);
+  return direct.length ? direct : groups.flatMap((group) => arrayFrom(group, ['accounts', 'items']));
+}
+
+function quotaAccountMap(payload: unknown) {
+  return new Map(quotaAccounts(payload).flatMap((item) => {
+    const id = stringValue(item.id ?? item.account_id);
+    return id ? [[id, item] as const] : [];
+  }));
+}
+
+function concurrencyRows(payload: unknown) {
+  const root = recordValue(payload);
+  return arrayFrom(root, ['accounts', 'rows', 'items', 'concurrency']);
+}
+
+function concurrencyRowMap(payload: unknown) {
+  return new Map(concurrencyRows(payload).flatMap((item) => {
+    const id = stringValue(item.id ?? item.account_id);
+    return id ? [[id, item] as const] : [];
+  }));
+}
+
+function pluginProviderDefinitions(payload: unknown) {
+  return arrayFrom(payload, ['plugins', 'items', 'data', 'list']).flatMap((entry) => {
+    if (entry.revoked_at || entry.active === false || entry.activation_state === 'inactive') return [];
+    const manifest = recordValue(entry.manifest ?? entry);
+    return arrayFrom(recordValue(manifest.provides), ['providers']);
+  });
+}
+
+function providerActionMap(builtinPayload: unknown, pluginPayload: unknown) {
+  const definitions = [...arrayFrom(builtinPayload, ['providers', 'items', 'data', 'list']), ...pluginProviderDefinitions(pluginPayload)];
+  return new Map(definitions.flatMap((definition) => {
+    const provider = stringValue(definition.name ?? definition.provider ?? definition.id).toLowerCase();
+    const actions = arrayFrom(recordValue(definition.account), ['actions']);
+    return provider && actions.length ? [[provider, actions] as const] : [];
+  }));
+}
+
+function providerAccountMap(builtinPayload: unknown, pluginPayload: unknown) {
+  const definitions = [...arrayFrom(builtinPayload, ['providers', 'items', 'data', 'list']), ...pluginProviderDefinitions(pluginPayload)];
+  return new Map(definitions.flatMap((definition) => {
+    const provider = stringValue(definition.name ?? definition.provider ?? definition.id).toLowerCase();
+    const account = recordValue(definition.account);
+    return provider && Object.keys(account).length ? [[provider, account] as const] : [];
+  }));
+}
+
+function accountCredentialFields(item: ApiRecord, providerAccount?: ApiRecord) {
+  const dynamic = arrayFrom(providerAccount, ['fields']).flatMap((field) => {
+    const key = stringValue(field.name ?? field.key);
+    if (!key) return [];
+    return [{ key, label: localizedText(field.label) || key, placeholder: stringValue(field.placeholder), secure: field.type === 'password' || field.secret === true }];
+  });
+  return dynamic.length ? dynamic : credentialFields[stringValue(item.provider).toLowerCase()] ?? [];
+}
+
+function quotaLines(item?: ApiRecord) {
+  if (!item) return [];
+  const windows = arrayFrom(recordValue(item.quota), ['windows', 'items']);
+  const sources = windows.length ? windows : [recordValue(item.quota), item].filter((value) => Object.keys(value).length);
+  return sources.flatMap((source) => {
+    const used = nestedNumber(source, ['used_percent', 'usage_percent', 'percent_used']);
+    const remaining = nestedNumber(source, ['remaining', 'available', 'balance', 'credit']);
+    const limit = nestedNumber(source, ['limit', 'total', 'max']);
+    const label = stringValue(source.label ?? source.name ?? source.key ?? source.period ?? source.window);
+    if (used !== undefined) return [`${label ? `${label} ` : ''}${Math.max(0, Math.min(100, used)).toFixed(used >= 10 ? 0 : 1)}% 已用`];
+    if (remaining !== undefined && limit !== undefined) return [`${label ? `${label} ` : ''}${remaining.toLocaleString('zh-CN')} / ${limit.toLocaleString('zh-CN')}`];
+    if (remaining !== undefined) return [`${label ? `${label} ` : ''}${remaining.toLocaleString('zh-CN')}`];
+    return [];
+  });
+}
+
+function quotaHeadline(item?: ApiRecord) {
+  const lines = quotaLines(item);
+  return lines.slice(0, 2).join(' · ');
+}
+
+function maskedIdentity(item: ApiRecord, privacy: boolean) {
+  const identity = accountIdentity(item);
+  if (!privacy) return identity;
+  return {
+    primary: maskAccountIdentity(identity.primary),
+    secondary: maskAccountIdentity(identity.secondary),
+  };
+}
+
+function accountAttentionRank(item: ApiRecord, proxies: ApiRecord[], proxiesLoaded: boolean, now: number) {
+  const status = accountStatus(item, now);
+  if (accountStatusNeedsAttention(status) || accountEgress(item, proxies, proxiesLoaded).missing) return 0;
+  if (status === 'cooldown' || status === 'rate_limited') return 1;
+  if (status === 'active') return 2;
+  return 3;
 }
 
 function accountId(item: ApiRecord) {
@@ -317,19 +465,24 @@ function SummaryMetric({ label, value, tone }: { label: string; value: number; t
   return <View style={{ minHeight: 30, flexDirection: 'row', alignItems: 'baseline', gap: 4 }}><Text style={{ color: foreground, fontSize: 14, fontWeight: '900' }}>{value}</Text><Text style={{ color: colors.subtext, fontSize: 11, fontWeight: '600' }}>{label}</Text></View>;
 }
 
-function AccountCard({ item, proxies, proxiesLoaded, now, toggling, toggleLocked, onPress, onToggle }: { item: ApiRecord; proxies: ApiRecord[]; proxiesLoaded: boolean; now: number; toggling: boolean; toggleLocked: boolean; onPress: () => void; onToggle: () => void }) {
+function AccountCard({ item, quota, concurrency, proxies, proxiesLoaded, privacy, selected, now, toggling, toggleLocked, onPress, onSelect, onToggle }: { item: ApiRecord; quota?: ApiRecord; concurrency?: ApiRecord; proxies: ApiRecord[]; proxiesLoaded: boolean; privacy: boolean; selected: boolean; now: number; toggling: boolean; toggleLocked: boolean; onPress: () => void; onSelect: () => void; onToggle: () => void }) {
   const colors = useAppTheme();
-  const identity = accountIdentity(item);
+  const identity = maskedIdentity(item, privacy);
   const provider = accountProvider(item);
   const status = accountStatus(item, now);
   const egress = accountEgress(item, proxies, proxiesLoaded);
   const reason = accountStatusReason(item, status);
   const plan = stringValue(item.plan_label);
   const priority = Number(item.priority ?? 0);
+  const ownLimit = Number(concurrency?.limit ?? item.concurrency_limit ?? 0) || 0;
+  const inuse = Number(concurrency?.inuse ?? concurrency?.in_use ?? 0) || 0;
+  const queued = Number(concurrency?.queued ?? 0) || 0;
+  const quotaText = quotaHeadline(quota ?? item);
   const warmupTimes = Array.isArray(item.warmup_times) ? item.warmup_times.map(String).filter(Boolean) : [];
   const egressText = egress.missing ? `出口缺失 · ${egress.label}` : egress.direct ? '直连' : `经 ${egress.label}`;
   return <Pressable accessibilityLabel={`编辑账号 ${identity.primary}`} accessibilityRole="button" onPress={onPress} style={({ pressed }) => ({ minHeight: 88, borderRadius: 16, borderWidth: 1, borderColor: egress.missing ? colors.warning : pressed ? colors.primary : colors.border, backgroundColor: pressed ? colors.mutedCard : colors.card, paddingHorizontal: 10, paddingVertical: 8, gap: 4, opacity: pressed ? 0.76 : 1 })}>
     <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 9 }}>
+      <Pressable accessibilityLabel={selected ? `取消选择 ${identity.primary}` : `选择 ${identity.primary}`} accessibilityRole="checkbox" accessibilityState={{ checked: selected }} hitSlop={5} onPress={(event) => { event.stopPropagation(); onSelect(); }} style={{ width: 26, height: 36, alignItems: 'center', justifyContent: 'center' }}>{selected ? <CheckSquare2 color={colors.primary} size={18} /> : <Square color={colors.subtext} size={18} />}</Pressable>
       <ProviderIcon provider={item} size={36} />
       <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}><Text numberOfLines={1} style={{ flex: 1, color: colors.text, fontSize: 13, fontWeight: '800' }}>{identity.primary}</Text><AccountToggleButton account={item} busy={toggling} locked={toggleLocked} onPress={onToggle} /></View>
@@ -337,12 +490,16 @@ function AccountCard({ item, proxies, proxiesLoaded, now, toggling, toggleLocked
         <Text numberOfLines={1} style={{ color: colors.subtext, fontSize: 11, fontWeight: '600' }}>{provider.label}{plan ? ` / ${plan}` : ''}</Text>
       </View>
     </View>
-    <View style={{ marginLeft: 45, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+    <View style={{ marginLeft: 80, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
       <View style={{ flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 5 }}><Network color={egress.missing ? colors.warning : colors.subtext} size={13} /><Text numberOfLines={1} style={{ flex: 1, color: egress.missing ? colors.warning : colors.subtext, fontSize: 11, fontWeight: egress.missing ? '700' : '500' }}>{egressText}</Text></View>
       <View style={{ flexShrink: 0, flexDirection: 'row', alignItems: 'center', gap: 5 }}><Clock3 color={colors.subtext} size={13} /><Text style={{ color: colors.subtext, fontSize: 11 }}>{accountLastUsed(item.last_used_at, now)}</Text></View>
     </View>
-    {reason ? <Text numberOfLines={2} style={{ marginLeft: 45, color: statusTone(status, colors).foreground, fontSize: 11, lineHeight: 14 }}>{reason}</Text> : null}
-    {item.ws_enabled || priority !== 0 || item.warmup_enabled || item.models_probe_error ? <View style={{ marginLeft: 45, flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
+    {quotaText || inuse || queued || ownLimit ? <View style={{ marginLeft: 80, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+      {quotaText ? <View style={{ flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 5 }}><Gauge color={colors.subtext} size={13} /><Text numberOfLines={1} style={{ flex: 1, color: colors.subtext, fontSize: 11 }}>{quotaText}</Text></View> : <View style={{ flex: 1 }} />}
+      {inuse || queued || ownLimit ? <Text style={{ color: colors.subtext, fontSize: 11 }}>并发 {inuse}/{ownLimit || '∞'}{queued ? ` · 排队 ${queued}` : ''}</Text> : null}
+    </View> : null}
+    {reason ? <Text numberOfLines={2} style={{ marginLeft: 80, color: statusTone(status, colors).foreground, fontSize: 11, lineHeight: 14 }}>{reason}</Text> : null}
+    {item.ws_enabled || priority !== 0 || item.warmup_enabled || item.models_probe_error ? <View style={{ marginLeft: 80, flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
       {item.ws_enabled ? <View style={{ paddingHorizontal: 7, paddingVertical: 3, borderRadius: 7, backgroundColor: colors.mutedCard }}><Text style={{ color: colors.subtext, fontSize: 11, fontWeight: '700' }}>WS</Text></View> : null}
       {priority !== 0 ? <View style={{ paddingHorizontal: 7, paddingVertical: 3, borderRadius: 7, backgroundColor: colors.mutedCard }}><Text style={{ color: colors.subtext, fontSize: 11, fontWeight: '700' }}>优先级 {priority}</Text></View> : null}
       {item.warmup_enabled ? <View style={{ paddingHorizontal: 7, paddingVertical: 3, borderRadius: 7, backgroundColor: item.warmup_last_error ? colors.warningBg : colors.mutedCard }}><Text numberOfLines={1} style={{ color: item.warmup_last_error ? colors.warning : colors.subtext, fontSize: 11, fontWeight: '700' }}>预热{warmupTimes.length ? ` ${warmupTimes.join(' ')}` : ''}</Text></View> : null}
@@ -359,7 +516,42 @@ function ActionRow({ icon: Icon, label, onPress, busy = false, disabled = false,
   </Pressable>;
 }
 
-function AccountActionsSheet({ account, busyAction, onClose, onRecover, onReauth, onEdit, onModels, onWarmup, onToggle, onExport, onDelete }: { account?: ApiRecord; busyAction: string; onClose: () => void; onRecover: () => void; onReauth: () => void; onEdit: () => void; onModels: () => void; onWarmup: () => void; onToggle: () => void; onExport: () => void; onDelete: () => void }) {
+function DiagnosticRow({ label, value, tone = 'normal' }: { label: string; value: string; tone?: 'normal' | 'success' | 'warning' | 'danger' }) {
+  const colors = useAppTheme();
+  const foreground = tone === 'success' ? colors.success : tone === 'warning' ? colors.warning : tone === 'danger' ? colors.danger : colors.text;
+  return <View style={{ minHeight: 42, borderTopWidth: 1, borderTopColor: colors.rowBorder, flexDirection: 'row', alignItems: 'center', gap: 10 }}><Text style={{ flex: 1, color: colors.subtext, fontSize: 11 }}>{label}</Text><Text numberOfLines={2} style={{ maxWidth: '65%', color: foreground, fontSize: 11, lineHeight: 15, fontWeight: '700', textAlign: 'right' }}>{value}</Text></View>;
+}
+
+function AccountDiagnosticsSheet({ account, quota, concurrency, proxies, proxiesLoaded, privacy, onClose, onEdit, onModels, onActions }: { account?: ApiRecord; quota?: ApiRecord; concurrency?: ApiRecord; proxies: ApiRecord[]; proxiesLoaded: boolean; privacy: boolean; onClose: () => void; onEdit: () => void; onModels: () => void; onActions: () => void }) {
+  if (!account) return <SheetFrame visible={false} onClose={onClose}><View /></SheetFrame>;
+  const identity = maskedIdentity(account, privacy);
+  const status = accountStatus(account);
+  const reason = accountStatusReason(account, status);
+  const egress = accountEgress(account, proxies, proxiesLoaded);
+  const quotaDetails = quotaLines(quota ?? account);
+  const limit = Number(concurrency?.limit ?? account.concurrency_limit ?? 0) || 0;
+  const inuse = Number(concurrency?.inuse ?? concurrency?.in_use ?? 0) || 0;
+  const queued = Number(concurrency?.queued ?? 0) || 0;
+  const models = Number(account.models_count);
+  return <SheetFrame visible onClose={onClose} maxHeight="92%">
+    <SheetHeader title={identity.primary || '账号诊断'} subtitle={[accountProvider(account).label, identity.secondary].filter(Boolean).join(' · ')} onClose={onClose} />
+    <ScrollView bounces={false} alwaysBounceVertical={false} overScrollMode="never" style={{ flexGrow: 0 }} contentContainerStyle={{ paddingBottom: 4 }}>
+      <DiagnosticRow label="状态" value={accountStatusLabels[status]} tone={status === 'active' ? 'success' : accountStatusNeedsAttention(status) ? 'danger' : 'warning'} />
+      {reason ? <DiagnosticRow label="状态原因" value={reason} tone="danger" /> : null}
+      <DiagnosticRow label="网络出口" value={egress.missing ? `${egress.label}（已失效）` : egress.direct ? '默认网络路径' : egress.label} tone={egress.missing ? 'danger' : 'normal'} />
+      {quotaDetails.length ? quotaDetails.map((line, index) => <DiagnosticRow key={`${line}-${index}`} label={index ? `余量 ${index + 1}` : '余量'} value={line} />) : <DiagnosticRow label="余量" value="暂无额度数据" tone="warning" />}
+      <DiagnosticRow label="并发" value={`${inuse} / ${limit || '∞'}${queued ? ` · 排队 ${queued}` : ''}`} tone={queued ? 'warning' : 'normal'} />
+      <DiagnosticRow label="优先级" value={`P${Number(account.priority ?? 0) || 0}`} />
+      <DiagnosticRow label="模型范围" value={Number.isFinite(models) ? `${models} 个模型` : '进入模型页查看'} tone={account.models_probe_error ? 'warning' : 'normal'} />
+      {account.models_probe_error ? <DiagnosticRow label="模型探测" value={String(account.models_probe_error)} tone="warning" /> : null}
+      <DiagnosticRow label="最近使用" value={accountLastUsed(account.last_used_at)} />
+      {account.warmup_last_error ? <DiagnosticRow label="预热异常" value={String(account.warmup_last_error)} tone="warning" /> : null}
+    </ScrollView>
+    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}><CompactButton icon={Pencil} label="编辑配置" onPress={onEdit} /><CompactButton icon={Boxes} label="模型与开关" primary onPress={onModels} /><CompactButton icon={SlidersHorizontal} label="账号操作" onPress={onActions} /></View>
+  </SheetFrame>;
+}
+
+function AccountActionsSheet({ account, dynamicActions, busyAction, onClose, onDiagnose, onRecover, onReauth, onEdit, onModels, onWarmup, onAutomation, onDynamicAction, onToggle, onExport, onDelete }: { account?: ApiRecord; dynamicActions: ApiRecord[]; busyAction: string; onClose: () => void; onDiagnose: () => void; onRecover: () => void; onReauth: () => void; onEdit: () => void; onModels: () => void; onWarmup: () => void; onAutomation: () => void; onDynamicAction: (action: ApiRecord) => void; onToggle: () => void; onExport: () => void; onDelete: () => void }) {
   const identity = account ? accountIdentity(account) : { primary: '', secondary: '' };
   const provider = account ? accountProvider(account) : accountProvider('');
   const status = account ? accountStatus(account) : 'active';
@@ -369,9 +561,12 @@ function AccountActionsSheet({ account, busyAction, onClose, onRecover, onReauth
     <ScrollView bounces={false} alwaysBounceVertical={false} overScrollMode="never" style={{ flexGrow: 0 }} contentContainerStyle={{ paddingBottom: 2 }}>
       {status === 'needs_reauth' ? <ActionRow icon={LogIn} label="重新登录" onPress={onReauth} disabled={Boolean(busyAction)} /> : null}
       {status !== 'active' ? <ActionRow icon={RotateCcw} label="恢复账号" onPress={onRecover} busy={busyAction === 'recover'} disabled={Boolean(busyAction) && busyAction !== 'recover'} /> : null}
+      <ActionRow icon={Activity} label="诊断与余量" onPress={onDiagnose} disabled={Boolean(busyAction)} />
       <ActionRow icon={Pencil} label="编辑" onPress={onEdit} disabled={Boolean(busyAction)} />
       <ActionRow icon={Boxes} label="查看可用模型" onPress={onModels} disabled={Boolean(busyAction)} />
       <ActionRow icon={Clock3} label="定时预热" onPress={onWarmup} disabled={Boolean(busyAction)} />
+      <ActionRow icon={Bot} label="插件自动化" onPress={onAutomation} disabled={Boolean(busyAction)} />
+      {dynamicActions.map((action, index) => { const id = stringValue(action.id ?? action.key) || String(index); return <ActionRow key={id} icon={Zap} label={localizedText(action.label) || id} busy={busyAction === `dynamic:${id}`} disabled={Boolean(busyAction) && busyAction !== `dynamic:${id}`} onPress={() => onDynamicAction(action)} />; })}
       <ActionRow icon={Power} label={rawDisabled ? '启用' : '禁用'} onPress={onToggle} busy={busyAction === 'toggle'} disabled={Boolean(busyAction) && busyAction !== 'toggle'} />
       <ActionRow icon={Download} label="导出" onPress={onExport} busy={busyAction === 'export'} disabled={Boolean(busyAction) && busyAction !== 'export'} />
       <ActionRow icon={Trash2} label="删除" onPress={onDelete} busy={busyAction === 'delete'} disabled={Boolean(busyAction) && busyAction !== 'delete'} danger />
@@ -392,15 +587,15 @@ function AccountInput({ label, value, onChangeText, placeholder, numeric = false
 }
 
 function emptyAccountDraft(): AccountDraft {
-  return { label: '', priority: '0', status: 'active', egressSelector: '', wsEnabled: false, credentials: {} };
+  return { label: '', priority: '0', concurrencyLimit: '', status: 'active', egressSelector: '', wsEnabled: false, credentials: {} };
 }
 
-function draftFromAccount(item: ApiRecord, proxies: ApiRecord[], proxiesLoaded: boolean): AccountDraft {
-  const provider = stringValue(item.provider).toLowerCase();
-  const credentials = Object.fromEntries((credentialFields[provider] ?? []).map((field) => [field.key, '']));
+function draftFromAccount(item: ApiRecord, proxies: ApiRecord[], proxiesLoaded: boolean, fields = accountCredentialFields(item)): AccountDraft {
+  const credentials = Object.fromEntries(fields.map((field) => [field.key, '']));
   return {
     label: stringValue(item.label),
     priority: String(Number(item.priority ?? 0) || 0),
+    concurrencyLimit: Number(item.concurrency_limit ?? 0) > 0 ? String(Number(item.concurrency_limit)) : '',
     status: stringValue(item.status) || 'active',
     egressSelector: accountEgress(item, proxies, proxiesLoaded).id,
     wsEnabled: Boolean(item.ws_enabled),
@@ -414,6 +609,8 @@ function accountEditPatch(item: ApiRecord, draft: AccountDraft, proxies: ApiReco
   if (label !== stringValue(item.label)) patch.label = label;
   const priority = Number(draft.priority);
   if (Number.isFinite(priority) && priority !== Number(item.priority ?? 0)) patch.priority = priority;
+  const concurrencyLimit = draft.concurrencyLimit.trim() === '' ? 0 : Number(draft.concurrencyLimit);
+  if (Number.isInteger(concurrencyLimit) && concurrencyLimit >= 0 && concurrencyLimit <= maxAccountConcurrency && concurrencyLimit !== Number(item.concurrency_limit ?? 0)) patch.concurrency_limit = concurrencyLimit;
   const rawStatus = stringValue(item.status);
   if ((rawStatus === 'active' || rawStatus === 'disabled') && draft.status !== rawStatus) patch.status = draft.status;
   const egress = accountEgress(item, proxies, proxiesLoaded);
@@ -439,29 +636,33 @@ function stickyProxyOwners(accounts: ApiRecord[], proxies: ApiRecord[]) {
   return owners;
 }
 
-function AccountEditSheet({ account, accounts, proxies, proxiesLoaded, onClose, onSaved, onActions }: { account?: ApiRecord; accounts: ApiRecord[]; proxies: ApiRecord[]; proxiesLoaded: boolean; onClose: () => void; onSaved: () => void; onActions: () => void }) {
+function AccountEditSheet({ account, providerAccount, accounts, proxies, proxiesLoaded, onClose, onSaved, onActions }: { account?: ApiRecord; providerAccount?: ApiRecord; accounts: ApiRecord[]; proxies: ApiRecord[]; proxiesLoaded: boolean; onClose: () => void; onSaved: () => void; onActions: () => void }) {
   const colors = useAppTheme();
   const [draft, setDraft] = useState<AccountDraft>(emptyAccountDraft());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const key = account ? accountId(account) : '';
+  const fields = account ? accountCredentialFields(account, providerAccount) : [];
+  const fieldsKey = fields.map((field) => field.key).join('\0');
+  const supportsWebSocket = !providerAccount || arrayFrom(providerAccount, ['controls']).some((control) => stringValue(control.key) === 'ws_enabled');
   const proxyOwners = useMemo(() => stickyProxyOwners(accounts, proxies), [accounts, proxies]);
 
   useEffect(() => {
-    setDraft(account ? draftFromAccount(account, proxies, proxiesLoaded) : emptyAccountDraft());
+    setDraft(account ? draftFromAccount(account, proxies, proxiesLoaded, fields) : emptyAccountDraft());
     setError('');
-  }, [key]);
+  }, [fieldsKey, key]);
 
   if (!account) return <SheetFrame visible={false} onClose={onClose}><View /></SheetFrame>;
   const provider = accountProvider(account);
   const egress = accountEgress(account, proxies, proxiesLoaded);
   const rawStatus = stringValue(account.status);
   const editableStatus = rawStatus === 'active' || rawStatus === 'disabled';
-  const fields = credentialFields[provider.key] ?? [];
   const priorityValid = draft.priority.trim() !== '' && Number.isFinite(Number(draft.priority));
+  const concurrencyLimit = draft.concurrencyLimit.trim() === '' ? 0 : Number(draft.concurrencyLimit);
+  const concurrencyValid = Number.isInteger(concurrencyLimit) && concurrencyLimit >= 0 && concurrencyLimit <= maxAccountConcurrency;
 
   async function save() {
-    if (!account || !priorityValid || saving) return;
+    if (!account || !priorityValid || !concurrencyValid || saving) return;
     setSaving(true);
     setError('');
     try {
@@ -484,21 +685,24 @@ function AccountEditSheet({ account, accounts, proxies, proxiesLoaded, onClose, 
     <ScrollView bounces={false} alwaysBounceVertical={false} overScrollMode="never" keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'} keyboardShouldPersistTaps="handled" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 11, paddingBottom: 4 }}>
       <AccountInput label="账号标签" value={draft.label} onChangeText={(label) => setDraft((current) => ({ ...current, label }))} placeholder={accountIdentity(account).primary} />
       <AccountInput label="优先级" value={draft.priority} onChangeText={(priority) => setDraft((current) => ({ ...current, priority }))} numeric />
+      <View style={{ flexDirection: 'row', gap: 6 }}>{[20, 0, -10].map((priority) => <Pressable key={priority} onPress={() => setDraft((current) => ({ ...current, priority: String(priority) }))} style={{ flex: 1, minHeight: 34, borderRadius: 10, backgroundColor: Number(draft.priority) === priority ? colors.primarySoft : colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><Text style={{ color: Number(draft.priority) === priority ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '800' }}>P{priority}</Text></Pressable>)}</View>
       {!priorityValid ? <Text style={{ color: colors.danger, fontSize: 11 }}>优先级必须是数字</Text> : null}
+      <AccountInput label="并发上限" value={draft.concurrencyLimit} onChangeText={(concurrencyLimit) => setDraft((current) => ({ ...current, concurrencyLimit }))} placeholder="留空或 0 跟随全局默认" numeric />
+      {!concurrencyValid ? <Text style={{ color: colors.danger, fontSize: 11 }}>并发上限必须是 0–{maxAccountConcurrency} 的整数</Text> : null}
       <View style={{ gap: 6 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>状态</Text>{editableStatus ? <View style={{ flexDirection: 'row', gap: 4, padding: 4, borderRadius: 12, backgroundColor: colors.mutedCard }}>{([['active', '启用'], ['disabled', '禁用']] as const).map(([status, label]) => <Pressable key={status} onPress={() => setDraft((current) => ({ ...current, status }))} style={{ flex: 1, minHeight: 38, borderRadius: 9, backgroundColor: draft.status === status ? colors.card : 'transparent', alignItems: 'center', justifyContent: 'center' }}><Text style={{ color: draft.status === status ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>{label}</Text></Pressable>)}</View> : <View style={{ minHeight: 42, borderRadius: 12, backgroundColor: colors.mutedCard, paddingHorizontal: 11, justifyContent: 'center' }}><Text style={{ color: colors.subtext, fontSize: 11 }}>{accountStatusLabels[accountStatus(account)]} · 系统维护状态</Text></View>}</View>
       <View style={{ gap: 7 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>出口代理</Text>{egress.advanced ? <View style={{ minHeight: 44, borderRadius: 12, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.mutedCard, paddingHorizontal: 11, justifyContent: 'center' }}><Text selectable numberOfLines={2} style={{ color: colors.subtext, fontFamily: 'monospace', fontSize: 11 }}>{stringValue(account.egress_selector)}</Text></View> : <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
         <Pressable onPress={() => setDraft((current) => ({ ...current, egressSelector: '' }))} style={{ minHeight: 36, paddingHorizontal: 11, borderRadius: 11, borderWidth: 1, borderColor: draft.egressSelector === '' ? colors.primary : colors.border, backgroundColor: draft.egressSelector === '' ? colors.primarySoft : colors.card, alignItems: 'center', justifyContent: 'center' }}><Text style={{ color: draft.egressSelector === '' ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>直连</Text></Pressable>
         {proxies.map((proxy, index) => { const id = stringValue(proxy.id) || String(index); const selected = draft.egressSelector === id; const name = stringValue(proxy.name) || stringValue(proxy.host) || id; const ownerId = proxyOwners[id]; const ownedByOther = Boolean(ownerId && ownerId !== accountId(account)); const owner = ownedByOther ? accounts.find((item) => accountId(item) === ownerId) : undefined; return <Pressable key={id} disabled={ownedByOther} onPress={() => setDraft((current) => ({ ...current, egressSelector: id }))} style={{ minHeight: 36, maxWidth: '100%', paddingHorizontal: 11, borderRadius: 11, borderWidth: 1, borderColor: selected ? colors.primary : colors.border, backgroundColor: selected ? colors.primarySoft : colors.card, alignItems: 'center', justifyContent: 'center', opacity: ownedByOther ? 0.45 : 1 }}><Text numberOfLines={1} style={{ color: selected ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>{name}{proxy.enabled === false ? '（禁用）' : ''}{proxy.sticky ? ' · 专属' : ''}{owner ? ` · 已分配给 ${accountIdentity(owner).primary}` : ''}</Text></Pressable>; })}
         {draft.egressSelector && !proxies.some((proxy) => stringValue(proxy.id) === draft.egressSelector) ? <View style={{ minHeight: 36, paddingHorizontal: 11, borderRadius: 11, backgroundColor: colors.warningBg, justifyContent: 'center' }}><Text style={{ color: colors.warning, fontSize: 11, fontWeight: '700' }}>{draft.egressSelector}（未找到）</Text></View> : null}
       </View>}</View>
-      <View style={{ minHeight: 46, borderTopWidth: 1, borderTopColor: colors.rowBorder, flexDirection: 'row', alignItems: 'center', gap: 9 }}><Wifi color={draft.wsEnabled ? colors.primary : colors.subtext} size={15} /><View style={{ flex: 1, gap: 2 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>WebSocket</Text><Text style={{ color: colors.subtext, fontSize: 11 }}>允许该账号承载 WebSocket 会话</Text></View><AppSwitch accessibilityLabel="WebSocket" value={draft.wsEnabled} onValueChange={(wsEnabled) => setDraft((current) => ({ ...current, wsEnabled }))} /></View>
+      {supportsWebSocket ? <View style={{ minHeight: 46, borderTopWidth: 1, borderTopColor: colors.rowBorder, flexDirection: 'row', alignItems: 'center', gap: 9 }}><Wifi color={draft.wsEnabled ? colors.primary : colors.subtext} size={15} /><View style={{ flex: 1, gap: 2 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>WebSocket</Text><Text style={{ color: colors.subtext, fontSize: 11 }}>允许该账号承载 WebSocket 会话</Text></View><AppSwitch accessibilityLabel="WebSocket" value={draft.wsEnabled} onValueChange={(wsEnabled) => setDraft((current) => ({ ...current, wsEnabled }))} /></View> : null}
       {fields.map((field) => <AccountInput key={field.key} label={field.label} value={draft.credentials[field.key] ?? ''} onChangeText={(value) => setDraft((current) => ({ ...current, credentials: { ...current.credentials, [field.key]: value } }))} placeholder={field.placeholder} secure={field.secure} />)}
       {fields.length ? <Text style={{ color: colors.subtext, fontSize: 11, lineHeight: 14 }}>凭据留空时保持现有值不变。</Text> : null}
     </ScrollView>
     {error ? <Text style={{ color: colors.danger, fontSize: 11 }}>{error}</Text> : null}
     <View style={{ flexDirection: 'row', gap: 8 }}>
       <CompactButton icon={SlidersHorizontal} label="账号操作" disabled={saving} onPress={onActions} />
-      <Pressable disabled={!priorityValid || saving} onPress={() => void save()} style={{ flexGrow: 2, flexBasis: 160, minWidth: 0, minHeight: 48, borderRadius: 13, backgroundColor: priorityValid && !saving ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }}>{saving ? <ActivityIndicator color="#fff" /> : <Save color="#fff" size={16} />}<Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>{saving ? '保存中...' : '保存账号'}</Text></Pressable>
+      <Pressable disabled={!priorityValid || !concurrencyValid || saving} onPress={() => void save()} style={{ flexGrow: 2, flexBasis: 160, minWidth: 0, minHeight: 48, borderRadius: 13, backgroundColor: priorityValid && concurrencyValid && !saving ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }}>{saving ? <ActivityIndicator color="#fff" /> : <Save color="#fff" size={16} />}<Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>{saving ? '保存中...' : '保存账号'}</Text></Pressable>
     </View>
   </SheetFrame>;
 }
@@ -514,6 +718,9 @@ function AccountModelsSheet({ account, onClose }: { account?: ApiRecord; onClose
   const [testAllError, setTestAllError] = useState('');
   const [copiedId, setCopiedId] = useState('');
   const [testStates, setTestStates] = useState<Record<string, ModelTestState>>({});
+  const [modelFilter, setModelFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
+  const [allowlist, setAllowlist] = useState<string[]>([]);
+  const [savingAllowlist, setSavingAllowlist] = useState(false);
   const activeTestRef = useRef(false);
   const testControllerRef = useRef<AbortController | undefined>(undefined);
   const testRunRef = useRef(0);
@@ -538,6 +745,9 @@ function AccountModelsSheet({ account, onClose }: { account?: ApiRecord; onClose
     setTestProgress(undefined);
     setTestAllError('');
     setTestStates({});
+    setModelFilter('all');
+    setAllowlist([]);
+    setSavingAllowlist(false);
     return () => {
       testRunRef.current += 1;
       testControllerRef.current?.abort();
@@ -550,11 +760,63 @@ function AccountModelsSheet({ account, onClose }: { account?: ApiRecord; onClose
   const envelope = findModelEnvelope(query.data);
   const supported = envelope?.supported !== false;
   const models = useMemo(() => normalizeAvailableModels(query.data, provider), [provider, query.data]);
+  const serverAllowed = Array.isArray(envelope?.allowed)
+    ? envelope.allowed.map(String).filter(Boolean)
+    : Array.isArray(account?.model_allowlist) ? account.model_allowlist.map(String).filter(Boolean) : [];
+  const serverAllowedKey = serverAllowed.join('\0');
+
+  useEffect(() => {
+    setAllowlist(serverAllowed);
+  }, [id, serverAllowedKey]);
+
+  const allModelIds = useMemo(() => [...new Set(models.map(availableModelId).filter(Boolean))], [models]);
+  const allowedSet = useMemo(() => new Set(allowlist.map((value) => value.toLowerCase())), [allowlist]);
+  const isAllowed = (model: string) => allowlist.length === 0 || allowedSet.has(model.toLowerCase());
+  const enabledCount = allowlist.length === 0 ? allModelIds.length : allModelIds.filter(isAllowed).length;
   const filtered = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    if (!keyword) return models;
-    return models.filter((item) => `${availableModelId(item)} ${item.display_name ?? ''} ${item.label ?? ''} ${item.provider ?? ''}`.toLowerCase().includes(keyword));
-  }, [models, search]);
+    return models.filter((item) => {
+      const model = availableModelId(item);
+      const enabled = allowlist.length === 0 || allowedSet.has(model.toLowerCase());
+      if (modelFilter === 'enabled' && !enabled) return false;
+      if (modelFilter === 'disabled' && enabled) return false;
+      return !keyword || `${model} ${item.display_name ?? ''} ${item.label ?? ''} ${item.provider ?? ''}`.toLowerCase().includes(keyword);
+    });
+  }, [allowlist.length, allowedSet, modelFilter, models, search]);
+
+  async function saveAllowlist(next: string[]) {
+    if (!id || savingAllowlist) return;
+    const previous = allowlist;
+    setAllowlist(next);
+    setSavingAllowlist(true);
+    try {
+      await apiJson(`/admin/accounts/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ model_allowlist: next }) });
+      await query.refetch();
+      void queryClient.invalidateQueries({ queryKey: ['admin', 'accounts'] });
+    } catch (error) {
+      setAllowlist(previous);
+      Alert.alert('模型配置保存失败', modelTestError(error));
+    } finally {
+      setSavingAllowlist(false);
+    }
+  }
+
+  function toggleModel(model: string) {
+    if (savingAllowlist) return;
+    const enabled = isAllowed(model);
+    if (enabled) {
+      const current = allowlist.length ? allowlist : allModelIds;
+      if (current.length <= 1) {
+        Alert.alert('至少保留一个模型', '账号必须至少启用一个可用模型。');
+        return;
+      }
+      void saveAllowlist(current.filter((value) => value.toLowerCase() !== model.toLowerCase()));
+      return;
+    }
+    const next = [...allowlist, model];
+    const coversAll = allModelIds.every((value) => next.some((candidate) => candidate.toLowerCase() === value.toLowerCase()));
+    void saveAllowlist(coversAll ? [] : next);
+  }
 
   async function testModel(idToTest: string) {
     const model = idToTest.trim();
@@ -644,7 +906,11 @@ function AccountModelsSheet({ account, onClose }: { account?: ApiRecord; onClose
         <View style={{ flexDirection: 'row', gap: 8 }}><TextInput value={manualModel} onChangeText={setManualModel} placeholder="输入模型 ID" placeholderTextColor={colors.placeholder} autoCapitalize="none" autoCorrect={false} style={{ flex: 1, minHeight: 44, borderRadius: 12, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card, color: colors.text, paddingHorizontal: 11, fontSize: 11, fontFamily: 'monospace' }} /><Pressable disabled={!manualTestEnabled} onPress={() => void testModel(manualModel)} style={{ width: 46, height: 44, borderRadius: 12, backgroundColor: manualTestEnabled || testing.has(manualModel.trim()) ? colors.primary : colors.disabled, alignItems: 'center', justifyContent: 'center' }}>{testing.has(manualModel.trim()) ? <ActivityIndicator color="#fff" size="small" /> : <Play color="#fff" size={16} />}</Pressable></View>
         {manualState ? <Text style={{ color: manualState.ok ? colors.success : colors.danger, fontSize: 11, lineHeight: 16 }}>{manualState.message} · {manualState.testedAt}</Text> : null}
       </View> : <>
-        <View style={{ minHeight: 38, flexDirection: 'row', alignItems: 'center', gap: 8 }}><Text style={{ flex: 1, color: colors.text, fontSize: 11, fontWeight: '800' }}>{models.length} 个模型</Text><Pressable disabled={!models.length || testsBusy} onPress={() => void testAll()} style={{ minHeight: 38, paddingHorizontal: 10, borderRadius: 11, backgroundColor: colors.primarySoft, flexDirection: 'row', alignItems: 'center', gap: 6, opacity: models.length ? 1 : 0.45 }}>{testingAll ? <ActivityIndicator color={colors.primary} size="small" /> : <RefreshCw color={colors.primary} size={14} />}<Text style={{ color: colors.primary, fontSize: 11, fontWeight: '800' }}>{testAllLabel}</Text></Pressable></View>
+        <View style={{ minHeight: 38, flexDirection: 'row', alignItems: 'center', gap: 8 }}><Text style={{ flex: 1, color: colors.text, fontSize: 11, fontWeight: '800' }}>{enabledCount} / {models.length} 已启用</Text><Pressable disabled={!models.length || testsBusy} onPress={() => void testAll()} style={{ minHeight: 38, paddingHorizontal: 10, borderRadius: 11, backgroundColor: colors.primarySoft, flexDirection: 'row', alignItems: 'center', gap: 6, opacity: models.length ? 1 : 0.45 }}>{testingAll ? <ActivityIndicator color={colors.primary} size="small" /> : <RefreshCw color={colors.primary} size={14} />}<Text style={{ color: colors.primary, fontSize: 11, fontWeight: '800' }}>{testAllLabel}</Text></Pressable></View>
+        <View style={{ flexDirection: 'row', gap: 6 }}>
+          {([['all', `全部 ${models.length}`], ['enabled', `已启用 ${enabledCount}`], ['disabled', `已停用 ${models.length - enabledCount}`]] as const).map(([value, label]) => <Pressable key={value} onPress={() => setModelFilter(value)} style={{ flex: 1, minHeight: 34, borderRadius: 10, backgroundColor: modelFilter === value ? colors.primarySoft : colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><Text numberOfLines={1} style={{ color: modelFilter === value ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>{label}</Text></Pressable>)}
+        </View>
+        <View style={{ flexDirection: 'row', gap: 6 }}><CompactButton icon={Check} label="全部启用" disabled={savingAllowlist || allowlist.length === 0} onPress={() => void saveAllowlist([])} /><CompactButton icon={Power} label="停用其余" disabled={savingAllowlist || allModelIds.length <= 1} onPress={() => void saveAllowlist(allModelIds.slice(0, 1))} /></View>
         {testAllError ? <Text numberOfLines={2} style={{ color: colors.danger, fontSize: 11, lineHeight: 14 }}>批量测试已中断：{testAllError}</Text> : null}
         <SearchField value={search} onChangeText={setSearch} placeholder="搜索模型" />
         {account?.models_probe_error ? <Text numberOfLines={2} style={{ color: colors.warning, fontSize: 11, lineHeight: 14 }}>目录探测：{String(account.models_probe_error)}</Text> : null}
@@ -667,8 +933,9 @@ function AccountModelsSheet({ account, onClose }: { account?: ApiRecord; onClose
             const probeTime = formatTimestamp(item.last_probe_at ?? item.probed_at ?? item.last_tested_at);
             const message = testState?.message || probeError;
             const ok = testState ? testState.ok : !probeError;
+            const enabled = isAllowed(model);
             return <View style={{ minHeight: 70, borderBottomWidth: 1, borderBottomColor: colors.rowBorder, paddingVertical: 10, gap: 6 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}><View style={{ width: 34, height: 34, borderRadius: 11, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><Boxes color={colors.primary} size={16} /></View><View style={{ flex: 1, minWidth: 0, gap: 2 }}><Text selectable numberOfLines={2} style={{ color: colors.text, fontSize: 11, lineHeight: 16, fontWeight: '800', fontFamily: 'monospace' }}>{model || '未命名模型'}</Text>{displayName || context ? <Text numberOfLines={1} style={{ color: colors.subtext, fontSize: 11 }}>{[displayName !== model ? displayName : '', context].filter(Boolean).join(' · ')}</Text> : null}</View><Pressable accessibilityLabel="复制模型 ID" onPress={() => void copyModel(model)} style={{ width: 34, height: 34, borderRadius: 10, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}>{copiedId === model ? <Check color={colors.success} size={15} /> : <Copy color={colors.subtext} size={15} />}</Pressable><Pressable accessibilityLabel="测试模型" disabled={testsBusy} onPress={() => void testModel(model)} style={{ width: 34, height: 34, borderRadius: 10, backgroundColor: colors.primarySoft, alignItems: 'center', justifyContent: 'center', opacity: testsBusy && !testing.has(model) ? 0.45 : 1 }}>{testing.has(model) ? <ActivityIndicator color={colors.primary} size="small" /> : <Play color={colors.primary} size={15} />}</Pressable></View>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}><AppSwitch accessibilityLabel={`启用 ${model}`} value={enabled} disabled={savingAllowlist} onValueChange={() => toggleModel(model)} /><View style={{ flex: 1, minWidth: 0, gap: 2 }}><Text selectable numberOfLines={2} style={{ color: enabled ? colors.text : colors.subtext, fontSize: 11, lineHeight: 16, fontWeight: '800', fontFamily: 'monospace' }}>{model || '未命名模型'}</Text>{displayName || context ? <Text numberOfLines={1} style={{ color: colors.subtext, fontSize: 11 }}>{[displayName !== model ? displayName : '', context].filter(Boolean).join(' · ')}</Text> : null}</View><Pressable accessibilityLabel="复制模型 ID" onPress={() => void copyModel(model)} style={{ width: 34, height: 34, borderRadius: 10, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}>{copiedId === model ? <Check color={colors.success} size={15} /> : <Copy color={colors.subtext} size={15} />}</Pressable><Pressable accessibilityLabel="测试模型" disabled={testsBusy} onPress={() => void testModel(model)} style={{ width: 34, height: 34, borderRadius: 10, backgroundColor: colors.primarySoft, alignItems: 'center', justifyContent: 'center', opacity: testsBusy && !testing.has(model) ? 0.45 : 1 }}>{testing.has(model) ? <ActivityIndicator color={colors.primary} size="small" /> : <Play color={colors.primary} size={15} />}</Pressable></View>
               {message || probeTime ? <Text numberOfLines={2} style={{ marginLeft: 42, color: ok ? colors.success : colors.danger, fontSize: 11, lineHeight: 14 }}>{message || '上次探测成功'}{testState?.testedAt ? ` · ${testState.testedAt}` : probeTime ? ` · ${probeTime}` : ''}</Text> : null}
             </View>;
           }}
@@ -743,6 +1010,96 @@ function WarmupSheet({ account, onClose, onSaved }: { account?: ApiRecord; onClo
   </SheetFrame>;
 }
 
+function localizedText(value: unknown) {
+  if (typeof value === 'string' || typeof value === 'number') return String(value).trim();
+  const record = recordValue(value);
+  return stringValue(record['zh-CN'] ?? record.zh ?? record.en ?? Object.values(record).find((entry) => typeof entry === 'string'));
+}
+
+function AutomationRunList({ accountId: id, hookId }: { accountId: string; hookId: string }) {
+  const colors = useAppTheme();
+  const runs = useQuery({
+    queryKey: ['admin', 'accounts', 'automation-runs', id, hookId],
+    queryFn: ({ signal }) => apiJson<unknown>(`/admin/accounts/${encodeURIComponent(id)}/plugin-schedule/${encodeURIComponent(hookId)}/runs`, { signal, query: { limit: 20 } }),
+  });
+  const items = arrayFrom(runs.data, ['runs', 'items']);
+  if (runs.isLoading) return <ActivityIndicator color={colors.primary} size="small" style={{ marginVertical: 8 }} />;
+  if (runs.error) return <Text style={{ color: colors.danger, fontSize: 11 }}>{runs.error.message}</Text>;
+  if (!items.length) return <Text style={{ color: colors.subtext, fontSize: 11 }}>暂无执行记录</Text>;
+  return <View style={{ gap: 5 }}>{items.map((item, index) => {
+    const status = stringValue(item.status) || 'unknown';
+    const ok = status === 'ok' || status === 'success';
+    return <View key={stringValue(item.id) || String(index)} style={{ borderTopWidth: 1, borderTopColor: colors.rowBorder, paddingTop: 6, gap: 2 }}><View style={{ flexDirection: 'row', gap: 7 }}><Text style={{ flex: 1, color: colors.subtext, fontSize: 11 }}>{formatTimestamp(item.finished_at ?? item.started_at)}</Text><Text style={{ color: ok ? colors.success : status === 'error' ? colors.danger : colors.subtext, fontSize: 11, fontWeight: '800' }}>{status}</Text></View>{item.summary ? <Text numberOfLines={3} style={{ color: colors.text, fontSize: 11, lineHeight: 15 }}>{String(item.summary)}</Text> : null}{item.error ? <Text numberOfLines={3} style={{ color: colors.danger, fontSize: 11, lineHeight: 15 }}>{String(item.error)}</Text> : null}</View>;
+  })}</View>;
+}
+
+function AutomationSheet({ account, onClose }: { account?: ApiRecord; onClose: () => void }) {
+  const colors = useAppTheme();
+  const id = account ? accountId(account) : '';
+  const [busyHook, setBusyHook] = useState('');
+  const [expandedHook, setExpandedHook] = useState('');
+  const schedule = useQuery({
+    queryKey: ['admin', 'accounts', 'automation', id],
+    queryFn: ({ signal }) => apiJson<unknown>(`/admin/accounts/${encodeURIComponent(id)}/plugin-schedule`, { signal }),
+    enabled: Boolean(id),
+    retry: 0,
+  });
+  const hooks = arrayFrom(schedule.data, ['hooks', 'items']);
+
+  async function toggle(hook: ApiRecord, enabled: boolean) {
+    const hookId = stringValue(hook.hook_id ?? hook.id);
+    const enabledBy = stringValue(hook.enabled_by);
+    if (!hookId || !enabledBy || busyHook) return;
+    setBusyHook(hookId);
+    try {
+      await apiJson(`/admin/accounts/${encodeURIComponent(id)}/plugin-settings`, { method: 'PUT', body: JSON.stringify({ values: { [enabledBy]: enabled } }) });
+      await schedule.refetch();
+    } catch (error) {
+      Alert.alert('自动化设置失败', modelTestError(error));
+    } finally {
+      setBusyHook('');
+    }
+  }
+
+  async function run(hook: ApiRecord) {
+    const hookId = stringValue(hook.hook_id ?? hook.id);
+    if (!hookId || busyHook) return;
+    setBusyHook(hookId);
+    try {
+      const result = await apiJson<ApiRecord>(`/admin/accounts/${encodeURIComponent(id)}/plugin-schedule/${encodeURIComponent(hookId)}/run`, { method: 'POST', timeoutMs: 120000 });
+      Alert.alert('执行完成', stringValue(result.message ?? result.summary) || `${localizedText(hook.label) || hookId} 已执行。`);
+      await schedule.refetch();
+      void queryClient.invalidateQueries({ queryKey: ['admin', 'accounts', 'automation-runs', id, hookId] });
+    } catch (error) {
+      Alert.alert('立即运行失败', modelTestError(error));
+    } finally {
+      setBusyHook('');
+    }
+  }
+
+  return <SheetFrame visible={Boolean(account)} onClose={onClose} maxHeight="92%">
+    <SheetHeader title="插件自动化" subtitle={account ? accountIdentity(account).primary : undefined} onClose={onClose} />
+    <ScrollView bounces={false} alwaysBounceVertical={false} overScrollMode="never" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 8, paddingBottom: 4 }}>
+      {schedule.isLoading ? <View style={{ minHeight: 140, alignItems: 'center', justifyContent: 'center' }}><ActivityIndicator color={colors.primary} /></View> : null}
+      {schedule.error ? <ErrorState message={schedule.error.message} retry={() => schedule.refetch()} /> : null}
+      {!schedule.isLoading && !schedule.error && !hooks.length ? <EmptyState embedded icon={Bot} message="该账号没有插件自动化任务" /> : null}
+      {hooks.map((hook, index) => {
+        const hookId = stringValue(hook.hook_id ?? hook.id) || String(index);
+        const label = localizedText(hook.label) || ({ daily_checkin: '每日签到', rewards: '自动领取奖励', wallet: '钱包管家', tasks: '自动完成任务' } as Record<string, string>)[hookId] || hookId;
+        const busy = busyHook === hookId;
+        const expanded = expandedHook === hookId;
+        const status = stringValue(hook.last_status);
+        return <View key={hookId} style={{ borderRadius: 13, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card, padding: 10, gap: 7 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}><View style={{ width: 34, height: 34, borderRadius: 10, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><Zap color={colors.primary} size={15} /></View><View style={{ flex: 1, minWidth: 0, gap: 2 }}><Text numberOfLines={1} style={{ color: colors.text, fontSize: 11, fontWeight: '800' }}>{label}</Text><Text numberOfLines={2} style={{ color: colors.subtext, fontSize: 11 }}>{[stringValue(hook.schedule), status, hook.last_run_at ? `上次 ${formatTimestamp(hook.last_run_at)}` : '', hook.next_run_at ? `下次 ${formatTimestamp(hook.next_run_at)}` : ''].filter(Boolean).join(' · ')}</Text></View>{busy ? <ActivityIndicator color={colors.primary} size="small" /> : <AppSwitch accessibilityLabel={label} value={Boolean(hook.enabled)} disabled={!hook.enabled_by} onValueChange={(value) => void toggle(hook, value)} />}</View>
+          {hook.last_error ? <Text numberOfLines={3} style={{ color: colors.danger, fontSize: 11, lineHeight: 15 }}>{String(hook.last_error)}</Text> : null}
+          <View style={{ flexDirection: 'row', gap: 7 }}><CompactButton icon={Play} label="立即运行" busy={busy} onPress={() => void run(hook)} /><CompactButton icon={History} label={expanded ? '收起记录' : '执行记录'} disabled={busy} onPress={() => setExpandedHook(expanded ? '' : hookId)} /></View>
+          {expanded ? <AutomationRunList accountId={id} hookId={hookId} /> : null}
+        </View>;
+      })}
+    </ScrollView>
+  </SheetFrame>;
+}
+
 function ImportSheet({ visible, onClose, onImported }: { visible: boolean; onClose: () => void; onImported: () => void }) {
   const colors = useAppTheme();
   const [file, setFile] = useState<DocumentPickerAsset>();
@@ -793,10 +1150,73 @@ function ImportSheet({ visible, onClose, onImported }: { visible: boolean; onClo
   </SheetFrame>;
 }
 
+function BulkSettingsSheet({ visible, count, proxies, busy, onClose, onApply }: { visible: boolean; count: number; proxies: ApiRecord[]; busy: boolean; onClose: () => void; onApply: (patch: ApiRecord) => void }) {
+  const colors = useAppTheme();
+  const [priority, setPriority] = useState('');
+  const [egress, setEgress] = useState('__unchanged__');
+  const [ws, setWs] = useState<'unchanged' | 'on' | 'off'>('unchanged');
+
+  useEffect(() => {
+    if (visible) {
+      setPriority('');
+      setEgress('__unchanged__');
+      setWs('unchanged');
+    }
+  }, [visible]);
+
+  const priorityNumber = priority.trim() === '' ? undefined : Number(priority);
+  const valid = priorityNumber === undefined || Number.isFinite(priorityNumber);
+  const patch: ApiRecord = {};
+  if (priorityNumber !== undefined && valid) patch.priority = priorityNumber;
+  if (egress !== '__unchanged__') patch.egress_selector = egress;
+  if (ws !== 'unchanged') patch.ws_enabled = ws === 'on';
+  const hasChanges = Object.keys(patch).length > 0;
+  return <SheetFrame visible={visible} onClose={onClose} maxHeight="88%">
+    <SheetHeader title={`批量配置 ${count} 个账号`} subtitle="只会更新已填写或已选择的项目" onClose={onClose} />
+    <ScrollView bounces={false} alwaysBounceVertical={false} overScrollMode="never" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 12 }}>
+      <AccountInput label="优先级" value={priority} onChangeText={setPriority} placeholder="留空保持不变" numeric />
+      {!valid ? <Text style={{ color: colors.danger, fontSize: 11 }}>优先级必须是数字</Text> : null}
+      <View style={{ gap: 7 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>出口代理</Text><View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
+        {[{ id: '__unchanged__', label: '保持不变' }, { id: '', label: '默认网络路径' }, ...proxies.map((proxy, index) => ({ id: stringValue(proxy.id) || String(index), label: stringValue(proxy.name ?? proxy.host ?? proxy.id) }))].map((option) => <Pressable key={option.id || 'direct'} onPress={() => setEgress(option.id)} style={{ minHeight: 36, paddingHorizontal: 10, borderRadius: 10, backgroundColor: egress === option.id ? colors.primarySoft : colors.mutedCard, justifyContent: 'center' }}><Text style={{ color: egress === option.id ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>{option.label}</Text></Pressable>)}
+      </View></View>
+      <View style={{ gap: 7 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>WebSocket</Text><View style={{ flexDirection: 'row', gap: 5 }}>{([['unchanged', '保持不变'], ['on', '启用'], ['off', '停用']] as const).map(([value, label]) => <Pressable key={value} onPress={() => setWs(value)} style={{ flex: 1, minHeight: 38, borderRadius: 10, backgroundColor: ws === value ? colors.primarySoft : colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><Text style={{ color: ws === value ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>{label}</Text></Pressable>)}</View></View>
+    </ScrollView>
+    <Pressable disabled={!valid || !hasChanges || busy} onPress={() => onApply(patch)} style={{ minHeight: 48, borderRadius: 13, backgroundColor: valid && hasChanges && !busy ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }}>{busy ? <ActivityIndicator color="#fff" /> : <Save color="#fff" size={16} />}<Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>应用批量配置</Text></Pressable>
+  </SheetFrame>;
+}
+
+function BulkWarmupSheet({ visible, count, busy, onClose, onApply }: { visible: boolean; count: number; busy: boolean; onClose: () => void; onApply: (patch: ApiRecord) => void }) {
+  const colors = useAppTheme();
+  const [enabled, setEnabled] = useState(true);
+  const [times, setTimes] = useState(['07:00']);
+  const [timezone, setTimezone] = useState('Asia/Shanghai');
+  const [model, setModel] = useState('');
+
+  useEffect(() => {
+    if (visible) {
+      setEnabled(true);
+      setTimes(['07:00']);
+      try { setTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'); } catch { setTimezone('Asia/Shanghai'); }
+      setModel('');
+    }
+  }, [visible]);
+
+  const valid = !enabled || (times.length > 0 && times.every((time) => /^([01]\d|2[0-3]):[0-5]\d$/.test(time)));
+  return <SheetFrame visible={visible} onClose={onClose} maxHeight="88%">
+    <SheetHeader title={`批量预热 ${count} 个账号`} subtitle="会覆盖所选账号现有的预热配置" onClose={onClose} />
+    <ScrollView bounces={false} alwaysBounceVertical={false} overScrollMode="never" style={{ flexGrow: 0 }} contentContainerStyle={{ gap: 12 }}>
+      <View style={{ minHeight: 48, borderRadius: 12, backgroundColor: colors.card, paddingHorizontal: 11, flexDirection: 'row', alignItems: 'center', gap: 8 }}><Clock3 color={enabled ? colors.primary : colors.subtext} size={16} /><Text style={{ flex: 1, color: colors.text, fontSize: 11, fontWeight: '700' }}>启用定时预热</Text><AppSwitch accessibilityLabel="批量启用定时预热" value={enabled} onValueChange={setEnabled} /></View>
+      {enabled ? <><View style={{ gap: 7 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>执行时间</Text>{times.map((time, index) => <View key={index} style={{ flexDirection: 'row', gap: 7 }}><TextInput value={time} onChangeText={(value) => setTimes((current) => current.map((entry, entryIndex) => entryIndex === index ? value : entry))} placeholder="07:00" placeholderTextColor={colors.placeholder} style={{ flex: 1, minHeight: 42, borderRadius: 12, borderWidth: 1, borderColor: /^([01]\d|2[0-3]):[0-5]\d$/.test(time) ? colors.border : colors.danger, color: colors.text, paddingHorizontal: 11, fontSize: 11 }} /><Pressable accessibilityLabel="移除时间" disabled={times.length <= 1} onPress={() => setTimes((current) => current.filter((_, entryIndex) => entryIndex !== index))} style={{ width: 42, height: 42, borderRadius: 12, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center', opacity: times.length <= 1 ? 0.4 : 1 }}><Trash2 color={colors.subtext} size={15} /></Pressable></View>)}<Pressable disabled={times.length >= 8} onPress={() => setTimes((current) => [...current, ''])} style={{ alignSelf: 'flex-start', minHeight: 36, paddingHorizontal: 10, borderRadius: 11, borderWidth: 1, borderColor: colors.border, flexDirection: 'row', alignItems: 'center', gap: 5 }}><Plus color={colors.primary} size={14} /><Text style={{ color: colors.primary, fontSize: 11, fontWeight: '800' }}>添加时间</Text></Pressable></View><AccountInput label="时区" value={timezone} onChangeText={setTimezone} /><AccountInput label="预热模型" value={model} onChangeText={setModel} placeholder="留空自动选择" /></> : null}
+      {!valid ? <Text style={{ color: colors.danger, fontSize: 11 }}>请填写有效时间，格式为 HH:mm。</Text> : null}
+    </ScrollView>
+    <Pressable disabled={!valid || busy} onPress={() => onApply({ warmup: { enabled, times: [...new Set(times)].sort(), timezone: timezone.trim(), model: model.trim() } })} style={{ minHeight: 48, borderRadius: 13, backgroundColor: valid && !busy ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }}>{busy ? <ActivityIndicator color="#fff" /> : <Save color="#fff" size={16} />}<Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>应用预热配置</Text></Pressable>
+  </SheetFrame>;
+}
+
 function FilterSheet({ mode, options, selected, onSelect, onClose }: { mode: FilterMode; options: ChoiceOption[]; selected: string; onSelect: (key: string) => void; onClose: () => void }) {
   const colors = useAppTheme();
   return <SheetFrame visible={Boolean(mode)} onClose={onClose} maxHeight="72%">
-    <SheetHeader title={mode === 'status' ? '筛选状态' : '筛选供应商'} onClose={onClose} />
+    <SheetHeader title={mode === 'status' ? '筛选状态' : mode === 'provider' ? '筛选供应商' : '筛选出口'} onClose={onClose} />
     <FlatList data={options} bounces={false} alwaysBounceVertical={false} overScrollMode="never" keyExtractor={(item) => item.key} style={{ flexGrow: 0 }} renderItem={({ item }) => <Pressable onPress={() => { onSelect(item.key); onClose(); }} style={({ pressed }) => ({ minHeight: 48, borderTopWidth: 1, borderTopColor: colors.rowBorder, flexDirection: 'row', alignItems: 'center', gap: 9, opacity: pressed ? 0.62 : 1 })}><View style={{ flex: 1, minWidth: 0, gap: 2 }}><Text numberOfLines={1} style={{ color: colors.text, fontSize: 11, fontWeight: selected === item.key ? '800' : '600' }}>{item.label}</Text>{item.detail ? <Text numberOfLines={1} style={{ color: colors.subtext, fontSize: 11 }}>{item.detail}</Text> : null}</View>{item.count !== undefined ? <Text style={{ color: colors.subtext, fontSize: 11 }}>{item.count}</Text> : null}{selected === item.key ? <Check color={colors.primary} size={16} /> : null}</Pressable>} />
   </SheetFrame>;
 }
@@ -805,6 +1225,7 @@ export default function AdminAccountsScreen() {
   const colors = useAppTheme();
   const router = useRouter();
   const screenFocused = useScreenFocus();
+  const privacy = usePrivacyMode();
   const { width } = useWindowDimensions();
   const wide = width >= 720;
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -813,11 +1234,20 @@ export default function AdminAccountsScreen() {
   const deferredSearch = useDeferredValue(search);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [providerFilter, setProviderFilter] = useState('all');
+  const [egressFilter, setEgressFilter] = useState('all');
+  const [listMode, setListMode] = useState<ListMode>('attention');
+  const [page, setPage] = useState(1);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [filterMode, setFilterMode] = useState<FilterMode>('');
   const [selectedId, setSelectedId] = useState('');
+  const [diagnosticsAccount, setDiagnosticsAccount] = useState<ApiRecord>();
   const [editingAccount, setEditingAccount] = useState<ApiRecord>();
   const [modelsAccount, setModelsAccount] = useState<ApiRecord>();
   const [warmupAccount, setWarmupAccount] = useState<ApiRecord>();
+  const [automationAccount, setAutomationAccount] = useState<ApiRecord>();
+  const [bulkSettingsVisible, setBulkSettingsVisible] = useState(false);
+  const [bulkWarmupVisible, setBulkWarmupVisible] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState('');
   const [importVisible, setImportVisible] = useState(false);
   const [busyAction, setBusyAction] = useState('');
   const [togglingId, setTogglingId] = useState('');
@@ -833,6 +1263,28 @@ export default function AdminAccountsScreen() {
     queryFn: async ({ signal }) => firstArray<ApiRecord>(await apiJson<unknown>('/admin/proxies', { signal }), ['proxies', 'items', 'data', 'list']),
     retry: 0,
   });
+  const quota = useQuery({
+    queryKey: ['admin', 'quota', 'accounts-page'],
+    queryFn: ({ signal }) => apiJson<unknown>('/admin/quota', { signal, cache: 'no-store' }),
+    refetchInterval: autoRefresh && screenFocused ? 30_000 : false,
+    retry: 0,
+  });
+  const concurrency = useQuery({
+    queryKey: ['admin', 'concurrency', 'accounts-page'],
+    queryFn: ({ signal }) => apiJson<unknown>('/admin/concurrency', { signal, cache: 'no-store' }),
+    refetchInterval: autoRefresh && screenFocused ? 10_000 : false,
+    retry: 0,
+  });
+  const builtinProviders = useQuery({
+    queryKey: ['admin', 'providers', 'builtin', 'account-actions'],
+    queryFn: ({ signal }) => apiJson<unknown>('/admin/providers/builtin', { signal }),
+    retry: 0,
+  });
+  const integrationPlugins = useQuery({
+    queryKey: ['admin', 'plugins', 'integration', 'account-actions'],
+    queryFn: ({ signal }) => apiJson<unknown>('/admin/plugins', { signal, query: { type: 'integration' } }),
+    retry: 0,
+  });
 
   useEffect(() => {
     if (!screenFocused) return;
@@ -841,29 +1293,41 @@ export default function AdminAccountsScreen() {
     return () => clearInterval(timer);
   }, [screenFocused]);
 
+  useEffect(() => {
+    setPage(1);
+  }, [deferredSearch, egressFilter, listMode, providerFilter, statusFilter]);
+
   const allAccounts = accounts.data ?? [];
   const proxyItems = proxies.data ?? [];
   const proxiesLoaded = proxies.isSuccess;
+  const quotaMap = useMemo(() => quotaAccountMap(quota.data), [quota.data]);
+  const concurrencyMap = useMemo(() => concurrencyRowMap(concurrency.data), [concurrency.data]);
+  const providerActions = useMemo(() => providerActionMap(builtinProviders.data, integrationPlugins.data), [builtinProviders.data, integrationPlugins.data]);
+  const providerAccounts = useMemo(() => providerAccountMap(builtinProviders.data, integrationPlugins.data), [builtinProviders.data, integrationPlugins.data]);
   const selectedAccount = allAccounts.find((item) => accountId(item) === selectedId);
   const providerOptions = useMemo(() => {
-    const map = new Map<string, ChoiceOption>();
+    const map = new Map<string, ChoiceOption & { servable: number }>();
     for (const item of allAccounts) {
       const provider = accountProvider(item);
       const current = map.get(provider.key);
-      map.set(provider.key, { key: provider.key, label: provider.label, detail: provider.key !== provider.label.toLowerCase() ? provider.key : undefined, count: (current?.count ?? 0) + 1 });
+      const servable = accountStatus(item, now) === 'active' && !accountEgress(item, proxyItems, proxiesLoaded).missing;
+      map.set(provider.key, { key: provider.key, label: provider.label, count: (current?.count ?? 0) + 1, servable: (current?.servable ?? 0) + (servable ? 1 : 0) });
     }
-    return [{ key: 'all', label: '全部供应商', count: allAccounts.length }, ...[...map.values()].sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'))];
-  }, [allAccounts]);
+    return [{ key: 'all', label: '全部供应商', count: allAccounts.length }, ...[...map.values()].sort((left, right) => left.label.localeCompare(right.label, 'zh-CN')).map((option) => ({ ...option, detail: `${option.servable}/${option.count} 可服务` }))];
+  }, [allAccounts, now, proxiesLoaded, proxyItems]);
 
   const counts = useMemo(() => {
     const statusCounts = Object.fromEntries(statusOrder.map((status) => [status, 0])) as Record<UpstreamAccountStatus, number>;
     let needsAttention = 0;
+    let servable = 0;
     for (const item of allAccounts) {
       const status = accountStatus(item, now);
       statusCounts[status] += 1;
-      if (accountStatusNeedsAttention(status) || accountEgress(item, proxyItems, proxiesLoaded).missing) needsAttention += 1;
+      const missingEgress = accountEgress(item, proxyItems, proxiesLoaded).missing;
+      if (accountStatusNeedsAttention(status) || missingEgress) needsAttention += 1;
+      if (status === 'active' && !missingEgress) servable += 1;
     }
-    return { statuses: statusCounts, needsAttention };
+    return { statuses: statusCounts, needsAttention, servable };
   }, [allAccounts, now, proxiesLoaded, proxyItems]);
 
   const statusOptions = useMemo<ChoiceOption[]>(() => [
@@ -871,22 +1335,138 @@ export default function AdminAccountsScreen() {
     ...statusOrder.map((status) => ({ key: status, label: accountStatusLabels[status], count: counts.statuses[status] })),
   ], [allAccounts.length, counts.statuses]);
 
+  const egressOptions = useMemo<ChoiceOption[]>(() => {
+    const direct = allAccounts.filter((item) => accountEgress(item, proxyItems, proxiesLoaded).direct).length;
+    const missing = allAccounts.filter((item) => accountEgress(item, proxyItems, proxiesLoaded).missing).length;
+    return [
+      { key: 'all', label: '全部出口', count: allAccounts.length },
+      { key: 'direct', label: '默认网络路径', count: direct },
+      { key: 'missing', label: '出口已失效', count: missing },
+      ...proxyItems.map((proxy, index) => {
+        const id = stringValue(proxy.id) || String(index);
+        return { key: id, label: stringValue(proxy.name ?? proxy.host ?? proxy.id) || id, count: allAccounts.filter((item) => accountEgress(item, proxyItems, proxiesLoaded).id === id).length };
+      }),
+    ];
+  }, [allAccounts, proxiesLoaded, proxyItems]);
+
   const filtered = useMemo(() => {
     const keyword = deferredSearch.trim().toLowerCase();
-    return allAccounts.filter((item) => {
+    const matches = allAccounts.filter((item) => {
       if (statusFilter !== 'all' && accountStatus(item, now) !== statusFilter) return false;
       if (providerFilter !== 'all' && accountProvider(item).key !== providerFilter) return false;
+      const egress = accountEgress(item, proxyItems, proxiesLoaded);
+      if (egressFilter === 'direct' && !egress.direct) return false;
+      if (egressFilter === 'missing' && !egress.missing) return false;
+      if (!['all', 'direct', 'missing'].includes(egressFilter) && egress.id !== egressFilter) return false;
       return !keyword || accountSearchText(item, proxyItems, proxiesLoaded).includes(keyword);
     });
-  }, [allAccounts, deferredSearch, now, providerFilter, proxiesLoaded, proxyItems, statusFilter]);
+    return matches.sort((left, right) => {
+      if (listMode === 'provider') {
+        const providerOrder = accountProvider(left).label.localeCompare(accountProvider(right).label, 'zh-CN');
+        if (providerOrder) return providerOrder;
+      } else {
+        const attention = accountAttentionRank(left, proxyItems, proxiesLoaded, now) - accountAttentionRank(right, proxyItems, proxiesLoaded, now);
+        if (attention) return attention;
+      }
+      return Number(right.priority ?? 0) - Number(left.priority ?? 0) || accountIdentity(left).primary.localeCompare(accountIdentity(right).primary, 'zh-CN');
+    });
+  }, [allAccounts, deferredSearch, egressFilter, listMode, now, providerFilter, proxiesLoaded, proxyItems, statusFilter]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / accountPageSize));
+  const currentPage = Math.min(page, pageCount);
+  const pageAccounts = filtered.slice((currentPage - 1) * accountPageSize, currentPage * accountPageSize);
+  const selectedAccounts = allAccounts.filter((item) => selectedIds.has(accountId(item)));
+  const pageIds = pageAccounts.map(accountId).filter(Boolean);
+  const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
 
   const selectedStatusLabel = statusFilter === 'all' ? '全部状态' : accountStatusLabels[statusFilter];
   const selectedProviderLabel = providerOptions.find((option) => option.key === providerFilter)?.label ?? '全部供应商';
-  const filtersActive = statusFilter !== 'all' || providerFilter !== 'all';
+  const selectedEgressLabel = egressOptions.find((option) => option.key === egressFilter)?.label ?? '全部出口';
+  const filtersActive = statusFilter !== 'all' || providerFilter !== 'all' || egressFilter !== 'all';
 
   function invalidate() {
     void queryClient.invalidateQueries({ queryKey: ['admin', 'accounts'] });
+    void queryClient.invalidateQueries({ queryKey: ['admin', 'quota'] });
+    void queryClient.invalidateQueries({ queryKey: ['admin', 'concurrency'] });
     void queryClient.invalidateQueries({ queryKey: ['admin', 'dashboard'] });
+  }
+
+  function toggleSelection(id: string) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  function togglePageSelection() {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allPageSelected) pageIds.forEach((id) => next.delete(id));
+      else pageIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+
+  async function applyBulkPatch(patch: ApiRecord, label: string) {
+    const ids = [...selectedIds];
+    if (!ids.length || bulkBusy) return;
+    setBulkBusy(label);
+    try {
+      await apiJson('/admin/accounts/bulk', { method: 'PUT', body: JSON.stringify({ ids, ...patch }), timeoutMs: 120000 });
+      setSelectedIds(new Set());
+      setBulkSettingsVisible(false);
+      setBulkWarmupVisible(false);
+      invalidate();
+      Alert.alert('批量操作完成', `已为 ${ids.length} 个账号${label}。`);
+    } catch (error) {
+      Alert.alert('批量操作失败', modelTestError(error));
+    } finally {
+      setBulkBusy('');
+    }
+  }
+
+  function confirmBulkPatch(patch: ApiRecord, label: string, destructive = false) {
+    const count = selectedIds.size;
+    if (!count) return;
+    Alert.alert(`批量${label}`, `确定为所选 ${count} 个账号${label}吗？`, [{ text: '取消', style: 'cancel' }, { text: '确认', style: destructive ? 'destructive' : 'default', onPress: () => void applyBulkPatch(patch, label) }]);
+  }
+
+  function recoverBulk() {
+    const ids = [...selectedIds];
+    if (!ids.length || bulkBusy) return;
+    Alert.alert('批量恢复账号', `确定恢复所选 ${ids.length} 个账号吗？`, [{ text: '取消', style: 'cancel' }, { text: '恢复', onPress: async () => {
+      setBulkBusy('恢复');
+      try {
+        await apiJson('/admin/accounts/recover', { method: 'POST', body: JSON.stringify({ ids }), timeoutMs: 120000 });
+        setSelectedIds(new Set());
+        invalidate();
+        Alert.alert('批量操作完成', `已恢复 ${ids.length} 个账号。`);
+      } catch (error) {
+        Alert.alert('批量恢复失败', modelTestError(error));
+      } finally {
+        setBulkBusy('');
+      }
+    } }]);
+  }
+
+  function deleteBulk() {
+    const ids = [...selectedIds];
+    if (!ids.length || bulkBusy) return;
+    Alert.alert('批量删除账号', `确定删除所选 ${ids.length} 个账号吗？该操作不可撤销。`, [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: async () => {
+      setBulkBusy('删除');
+      try {
+        for (const id of ids) await apiJson(`/admin/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        setSelectedIds(new Set());
+        invalidate();
+        Alert.alert('批量操作完成', `已删除 ${ids.length} 个账号。`);
+      } catch (error) {
+        invalidate();
+        Alert.alert('批量删除未完全完成', modelTestError(error));
+      } finally {
+        setBulkBusy('');
+      }
+    } }]);
   }
 
   async function toggleAccount(item: ApiRecord) {
@@ -930,8 +1510,9 @@ export default function AdminAccountsScreen() {
   function reauthSelected() {
     if (!selectedAccount) return;
     const proxyId = stringValue(selectedAccount.proxy_id);
+    const provider = accountProvider(selectedAccount).key;
     setSelectedId('');
-    router.push({ pathname: '/admin-account-import', params: proxyId ? { proxy_id: proxyId } : undefined } as never);
+    router.push({ pathname: '/admin-account-import', params: { provider, ...(proxyId ? { proxy_id: proxyId } : {}) } } as never);
   }
 
   function toggleSelected() {
@@ -943,6 +1524,42 @@ export default function AdminAccountsScreen() {
   function deleteSelected() {
     if (!selectedAccount) return;
     Alert.alert('删除账号', `确定删除「${accountIdentity(selectedAccount).primary}」吗？该操作不可撤销。`, [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: () => void runAction('delete', '删除账号', () => apiJson(`/admin/accounts/${encodeURIComponent(accountId(selectedAccount))}`, { method: 'DELETE' })) }]);
+  }
+
+  function runDynamicAction(action: ApiRecord) {
+    if (!selectedAccount) return;
+    const actionId = stringValue(action.id ?? action.key);
+    const label = localizedText(action.label) || actionId || '供应商操作';
+    if (!actionId) return;
+    const execute = async () => {
+      if (action.type === 'link') {
+        const url = stringValue(action.url);
+        if (!/^https?:\/\//i.test(url)) {
+          Alert.alert('无法打开链接', '供应商返回的链接不是受支持的 HTTP(S) 地址。');
+          return;
+        }
+        await Linking.openURL(url);
+        return;
+      }
+      if (action.type === 'flow') {
+        const proxyId = accountEgress(selectedAccount, proxyItems, proxiesLoaded).id;
+        setSelectedId('');
+        router.push({ pathname: '/admin-account-import', params: { provider: accountProvider(selectedAccount).key, ...(proxyId ? { proxy_id: proxyId } : {}) } } as never);
+        return;
+      }
+      setBusyAction(`dynamic:${actionId}`);
+      try {
+        const result = await apiJson<ApiRecord>(`/admin/accounts/${encodeURIComponent(accountId(selectedAccount))}/actions/${encodeURIComponent(actionId)}`, { method: 'POST', body: '{}' });
+        Alert.alert(`${label}完成`, stringValue(result.message ?? recordValue(result.data).message) || '操作已完成。');
+        invalidate();
+      } catch (error) {
+        Alert.alert(`${label}失败`, modelTestError(error));
+      } finally {
+        setBusyAction('');
+      }
+    };
+    if (action.confirm === false) void execute();
+    else Alert.alert(label, `确定对「${accountIdentity(selectedAccount).primary}」执行${label}吗？`, [{ text: '取消', style: 'cancel' }, { text: '确认', onPress: () => void execute() }]);
   }
 
   function confirmExport(ids: string[], count: number, all = false) {
@@ -968,8 +1585,8 @@ export default function AdminAccountsScreen() {
   return <>
     <Page title="上游账号" subtitle="账号状态、网络出口与运行维护" icon={CloudCog} safeTop={false} contentMaxWidth={1180} scrollable={false} showHeader={false}>
       <FlatList
-        data={filtered}
-        extraData={`${now}:${togglingId}:${busyAction}`}
+        data={pageAccounts}
+        extraData={`${now}:${togglingId}:${busyAction}:${privacy.enabled}:${[...selectedIds].join(',')}`}
         bounces={false}
         alwaysBounceVertical={false}
         overScrollMode="never"
@@ -983,51 +1600,63 @@ export default function AdminAccountsScreen() {
         maxToRenderPerBatch={12}
         windowSize={7}
         style={{ flex: 1, width: '100%' }}
-        contentContainerStyle={{ gap: 6, paddingBottom: 10, flexGrow: filtered.length ? 0 : 1 }}
+        contentContainerStyle={{ gap: 6, paddingBottom: 10, flexGrow: pageAccounts.length ? 0 : 1 }}
         ListHeaderComponent={<View style={{ gap: 8, paddingBottom: 2 }}>
-          <PageHeader title="上游账号" subtitle="账号状态、网络出口与运行维护" icon={CloudCog} refreshing={accounts.isFetching} onRefresh={() => { void accounts.refetch(); void proxies.refetch(); }} />
+          <PageHeader title="上游账号" subtitle="账号状态、网络出口与运行维护" icon={CloudCog} refreshing={accounts.isFetching || quota.isFetching || concurrency.isFetching} onRefresh={() => { void accounts.refetch(); void proxies.refetch(); void quota.refetch(); void concurrency.refetch(); }} />
           <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
+            <Pressable accessibilityLabel={privacy.enabled ? '显示完整账号' : '隐藏账号信息'} accessibilityState={{ selected: privacy.enabled }} onPress={() => setPrivacyMode(!privacy.enabled)} style={{ width: 42, height: 42, borderRadius: 12, borderWidth: 1, borderColor: privacy.enabled ? colors.primary : colors.border, backgroundColor: privacy.enabled ? colors.primarySoft : colors.card, alignItems: 'center', justifyContent: 'center' }}>{privacy.enabled ? <EyeOff color={colors.primary} size={17} /> : <Eye color={colors.subtext} size={17} />}</Pressable>
             <CompactButton icon={FileUp} label="导入文件" onPress={() => setImportVisible(true)} />
             <CompactButton icon={Download} label="导出全部" busy={exportingAll} disabled={!allAccounts.length} onPress={() => confirmExport([], allAccounts.length, true)} />
             <CompactButton icon={Plus} label="添加账号" primary onPress={() => router.push('/admin-account-import' as never)} />
           </View>
           <View style={{ minHeight: 40, borderBottomWidth: 1, borderBottomColor: colors.rowBorder, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 10 }}>
             <SummaryMetric label="全部" value={allAccounts.length} />
-            <SummaryMetric label="启用" value={counts.statuses.active} tone="success" />
+            <SummaryMetric label="可服务" value={counts.servable} tone="success" />
             <SummaryMetric label="需处理" value={counts.needsAttention} tone={counts.needsAttention ? 'danger' : undefined} />
             <SummaryMetric label="禁用" value={counts.statuses.disabled} tone={counts.statuses.disabled ? 'danger' : undefined} />
             <View style={{ marginLeft: wide ? 'auto' : 0, minHeight: 32, flexDirection: 'row', alignItems: 'center', gap: 6 }}><RefreshCw color={autoRefresh ? colors.primary : colors.subtext} size={14} /><Text style={{ color: colors.subtext, fontSize: 11, fontWeight: '600' }}>自动刷新</Text><AppSwitch accessibilityLabel="自动刷新" value={autoRefresh} onValueChange={setAutoRefresh} /></View>
           </View>
           <View style={{ flexDirection: wide ? 'row' : 'column', gap: 7 }}>
             <View style={{ flex: wide ? 1 : undefined, minHeight: 44 }}><SearchField value={search} onChangeText={setSearch} placeholder="搜索账号、邮箱、供应商或出口" /></View>
-            <View style={{ minWidth: wide ? 360 : undefined, flexDirection: 'row', gap: 7 }}><FilterButton icon={Filter} label={selectedStatusLabel} active={statusFilter !== 'all'} onPress={() => setFilterMode('status')} /><FilterButton icon={SlidersHorizontal} label={selectedProviderLabel} active={providerFilter !== 'all'} onPress={() => setFilterMode('provider')} />{filtersActive ? <Pressable accessibilityLabel="清除筛选" onPress={() => { setStatusFilter('all'); setProviderFilter('all'); }} style={{ width: 42, height: 42, borderRadius: 12, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><X color={colors.subtext} size={15} /></Pressable> : null}</View>
+            <View style={{ minWidth: wide ? 520 : undefined, flexDirection: 'row', gap: 7 }}><FilterButton icon={Filter} label={selectedStatusLabel} active={statusFilter !== 'all'} onPress={() => setFilterMode('status')} /><FilterButton icon={SlidersHorizontal} label={selectedProviderLabel} active={providerFilter !== 'all'} onPress={() => setFilterMode('provider')} /><FilterButton icon={Network} label={selectedEgressLabel} active={egressFilter !== 'all'} onPress={() => setFilterMode('egress')} />{filtersActive ? <Pressable accessibilityLabel="清除筛选" onPress={() => { setStatusFilter('all'); setProviderFilter('all'); setEgressFilter('all'); }} style={{ width: 42, height: 42, borderRadius: 12, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}><X color={colors.subtext} size={15} /></Pressable> : null}</View>
           </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}><Pressable accessibilityLabel={allPageSelected ? '取消选择本页' : '选择本页'} onPress={togglePageSelection} style={{ width: 40, height: 38, borderRadius: 11, backgroundColor: allPageSelected ? colors.primarySoft : colors.mutedCard, alignItems: 'center', justifyContent: 'center' }}>{allPageSelected ? <CheckSquare2 color={colors.primary} size={17} /> : <Square color={colors.subtext} size={17} />}</Pressable><View style={{ flex: 1, flexDirection: 'row', padding: 3, borderRadius: 10, backgroundColor: colors.mutedCard }}>{([['attention', '优先排障', Wrench], ['provider', '按供应商分组', Layers3]] as const).map(([value, label, Icon]) => <Pressable key={value} onPress={() => setListMode(value)} style={{ flex: 1, minHeight: 32, borderRadius: 8, backgroundColor: listMode === value ? colors.card : 'transparent', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5 }}><Icon color={listMode === value ? colors.primary : colors.subtext} size={14} /><Text numberOfLines={1} style={{ color: listMode === value ? colors.primary : colors.subtext, fontSize: 11, fontWeight: '700' }}>{label}</Text></Pressable>)}</View></View>
+          {selectedIds.size ? <View style={{ borderTopWidth: 1, borderBottomWidth: 1, borderColor: colors.rowBorder, paddingVertical: 8, gap: 7 }}><View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}><Text style={{ flex: 1, color: colors.text, fontSize: 11, fontWeight: '800' }}>已选择 {selectedIds.size} 个</Text><Pressable onPress={() => setSelectedIds(new Set())}><Text style={{ color: colors.primary, fontSize: 11, fontWeight: '700' }}>清除</Text></Pressable></View><View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}><CompactButton icon={Play} label="启用" disabled={Boolean(bulkBusy)} onPress={() => confirmBulkPatch({ status: 'active' }, '启用')} /><CompactButton icon={Power} label="禁用" disabled={Boolean(bulkBusy)} onPress={() => confirmBulkPatch({ status: 'disabled' }, '禁用', true)} /><CompactButton icon={RotateCcw} label="恢复" disabled={Boolean(bulkBusy)} onPress={recoverBulk} /><CompactButton icon={SlidersHorizontal} label="批量配置" disabled={Boolean(bulkBusy)} onPress={() => setBulkSettingsVisible(true)} /><CompactButton icon={Clock3} label="批量预热" disabled={Boolean(bulkBusy)} onPress={() => setBulkWarmupVisible(true)} /><CompactButton icon={Download} label="导出" disabled={Boolean(bulkBusy)} onPress={() => confirmExport([...selectedIds], selectedIds.size)} /><CompactButton icon={Trash2} label="删除" disabled={Boolean(bulkBusy)} onPress={deleteBulk} /></View></View> : null}
           {proxies.error ? <Text style={{ color: colors.warning, fontSize: 11 }}>出口配置暂时无法核对：{proxies.error.message}</Text> : null}
           {accounts.error ? <ErrorState message={accounts.error.message} retry={() => accounts.refetch()} /> : null}
-          {accounts.data ? <Text style={{ color: colors.subtext, fontSize: 11 }}>显示 {filtered.length} / {allAccounts.length}</Text> : null}
+          {accounts.data ? <Text style={{ color: colors.subtext, fontSize: 11 }}>显示 {filtered.length} / {allAccounts.length} · 第 {currentPage} / {pageCount} 页</Text> : null}
         </View>}
         ListEmptyComponent={accounts.isLoading ? <View style={{ flex: 1, minHeight: 180, alignItems: 'center', justifyContent: 'center' }}><ActivityIndicator color={colors.primary} /></View> : <EmptyState icon={filtersActive || search.trim() ? SearchX : CloudCog} message={filtersActive || search.trim() ? '没有匹配的账号' : '暂无上游账号'} />}
-        renderItem={({ item }) => <AccountCard item={item} proxies={proxyItems} proxiesLoaded={proxiesLoaded} now={now} toggling={togglingId === accountId(item)} toggleLocked={Boolean(togglingId || busyAction)} onPress={() => setEditingAccount(item)} onToggle={() => void toggleAccount(item)} />}
+        ListFooterComponent={filtered.length ? <View style={{ minHeight: 48, paddingTop: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 }}><Pressable accessibilityLabel="上一页" disabled={currentPage <= 1} onPress={() => setPage((value) => Math.max(1, value - 1))} style={{ width: 38, height: 38, borderRadius: 11, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center', opacity: currentPage <= 1 ? 0.4 : 1 }}><ChevronLeft color={colors.text} size={17} /></Pressable><Text style={{ color: colors.subtext, fontSize: 11 }}>第 {currentPage} / {pageCount} 页</Text><Pressable accessibilityLabel="下一页" disabled={currentPage >= pageCount} onPress={() => setPage((value) => Math.min(pageCount, value + 1))} style={{ width: 38, height: 38, borderRadius: 11, backgroundColor: colors.mutedCard, alignItems: 'center', justifyContent: 'center', opacity: currentPage >= pageCount ? 0.4 : 1 }}><ChevronRight color={colors.text} size={17} /></Pressable></View> : null}
+        renderItem={({ item, index }) => <View style={{ gap: 6 }}>{listMode === 'provider' && (index === 0 || accountProvider(pageAccounts[index - 1]).key !== accountProvider(item).key) ? <View style={{ minHeight: 30, flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: index ? 6 : 0 }}><ProviderIcon provider={item} size={26} /><Text style={{ flex: 1, color: colors.text, fontSize: 12, fontWeight: '800' }}>{accountProvider(item).label}</Text><Text style={{ color: colors.subtext, fontSize: 11 }}>{filtered.filter((candidate) => accountProvider(candidate).key === accountProvider(item).key).length} 个</Text></View> : null}<AccountCard item={item} quota={quotaMap.get(accountId(item))} concurrency={concurrencyMap.get(accountId(item))} proxies={proxyItems} proxiesLoaded={proxiesLoaded} privacy={privacy.enabled} selected={selectedIds.has(accountId(item))} now={now} toggling={togglingId === accountId(item)} toggleLocked={Boolean(togglingId || busyAction || bulkBusy)} onPress={() => setDiagnosticsAccount(item)} onSelect={() => toggleSelection(accountId(item))} onToggle={() => void toggleAccount(item)} /></View>}
       />
     </Page>
 
     <AccountActionsSheet
       account={selectedAccount}
+      dynamicActions={selectedAccount ? providerActions.get(accountProvider(selectedAccount).key) ?? [] : []}
       busyAction={busyAction}
       onClose={() => setSelectedId('')}
+      onDiagnose={() => { if (selectedAccount) setDiagnosticsAccount(selectedAccount); setSelectedId(''); }}
       onRecover={recoverSelected}
       onReauth={reauthSelected}
       onEdit={() => { if (selectedAccount) setEditingAccount(selectedAccount); setSelectedId(''); }}
       onModels={() => { if (selectedAccount) setModelsAccount(selectedAccount); setSelectedId(''); }}
       onWarmup={() => { if (selectedAccount) setWarmupAccount(selectedAccount); setSelectedId(''); }}
+      onAutomation={() => { if (selectedAccount) setAutomationAccount(selectedAccount); setSelectedId(''); }}
+      onDynamicAction={runDynamicAction}
       onToggle={toggleSelected}
       onExport={() => { if (selectedAccount) confirmExport([accountId(selectedAccount)], 1); }}
       onDelete={deleteSelected}
     />
-    <AccountEditSheet account={editingAccount} accounts={allAccounts} proxies={proxyItems} proxiesLoaded={proxiesLoaded} onClose={() => setEditingAccount(undefined)} onSaved={invalidate} onActions={() => { if (!editingAccount) return; setSelectedId(accountId(editingAccount)); setEditingAccount(undefined); }} />
+    <AccountDiagnosticsSheet account={diagnosticsAccount} quota={diagnosticsAccount ? quotaMap.get(accountId(diagnosticsAccount)) : undefined} concurrency={diagnosticsAccount ? concurrencyMap.get(accountId(diagnosticsAccount)) : undefined} proxies={proxyItems} proxiesLoaded={proxiesLoaded} privacy={privacy.enabled} onClose={() => setDiagnosticsAccount(undefined)} onEdit={() => { if (diagnosticsAccount) setEditingAccount(diagnosticsAccount); setDiagnosticsAccount(undefined); }} onModels={() => { if (diagnosticsAccount) setModelsAccount(diagnosticsAccount); setDiagnosticsAccount(undefined); }} onActions={() => { if (diagnosticsAccount) setSelectedId(accountId(diagnosticsAccount)); setDiagnosticsAccount(undefined); }} />
+    <AccountEditSheet account={editingAccount} providerAccount={editingAccount ? providerAccounts.get(accountProvider(editingAccount).key) : undefined} accounts={allAccounts} proxies={proxyItems} proxiesLoaded={proxiesLoaded} onClose={() => setEditingAccount(undefined)} onSaved={invalidate} onActions={() => { if (!editingAccount) return; setSelectedId(accountId(editingAccount)); setEditingAccount(undefined); }} />
     <AccountModelsSheet account={modelsAccount} onClose={() => setModelsAccount(undefined)} />
     <WarmupSheet account={warmupAccount} onClose={() => setWarmupAccount(undefined)} onSaved={invalidate} />
+    <AutomationSheet account={automationAccount} onClose={() => setAutomationAccount(undefined)} />
     <ImportSheet visible={importVisible} onClose={() => setImportVisible(false)} onImported={invalidate} />
-    <FilterSheet mode={filterMode} options={filterMode === 'status' ? statusOptions : providerOptions} selected={filterMode === 'status' ? statusFilter : providerFilter} onSelect={(value) => filterMode === 'status' ? setStatusFilter(value as StatusFilter) : setProviderFilter(value)} onClose={() => setFilterMode('')} />
+    <BulkSettingsSheet visible={bulkSettingsVisible} count={selectedIds.size} proxies={proxyItems} busy={Boolean(bulkBusy)} onClose={() => setBulkSettingsVisible(false)} onApply={(patch) => void applyBulkPatch(patch, '更新配置')} />
+    <BulkWarmupSheet visible={bulkWarmupVisible} count={selectedIds.size} busy={Boolean(bulkBusy)} onClose={() => setBulkWarmupVisible(false)} onApply={(patch) => void applyBulkPatch(patch, '更新预热配置')} />
+    <FilterSheet mode={filterMode} options={filterMode === 'status' ? statusOptions : filterMode === 'provider' ? providerOptions : egressOptions} selected={filterMode === 'status' ? statusFilter : filterMode === 'provider' ? providerFilter : egressFilter} onSelect={(value) => filterMode === 'status' ? setStatusFilter(value as StatusFilter) : filterMode === 'provider' ? setProviderFilter(value) : setEgressFilter(value)} onClose={() => setFilterMode('')} />
   </>;
 }

@@ -716,6 +716,12 @@ POST   /api/v1/admin/accounts/recover
 POST   /api/v1/admin/accounts/:id/recover
 GET    /api/v1/admin/accounts/:id/models
 POST   /api/v1/admin/accounts/:id/models/test
+GET    /api/v1/admin/accounts/candidate-models?provider=:provider
+POST   /api/v1/admin/accounts/:id/actions/:action
+GET    /api/v1/admin/accounts/:id/plugin-schedule
+PUT    /api/v1/admin/accounts/:id/plugin-settings
+GET    /api/v1/admin/accounts/:id/plugin-schedule/:hook/runs
+POST   /api/v1/admin/accounts/:id/plugin-schedule/:hook/run
 ```
 
 Account 字段（前端/业务推断）：
@@ -729,8 +735,10 @@ Account 字段（前端/业务推断）：
 | `status_reason` | string | 状态原因 |
 | `enabled` | boolean | 是否启用 |
 | `priority` | number | 优先级 |
+| `concurrency_limit` | number | 单账号并发上限；`0` 表示跟随全局默认 |
 | `quota` | object | 额度信息 |
 | `models` | string[] | 模型列表 |
+| `model_allowlist` | string[] | 允许使用的模型；空数组表示全部 |
 | `proxy_id` | string/int/null | 代理 ID |
 | `created_at` | string | 创建时间 |
 | `updated_at` | string | 更新时间 |

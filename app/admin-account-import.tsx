@@ -4,6 +4,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { useLocalSearchParams } from 'expo-router';
 import {
   ArrowLeft,
+  Boxes,
   CheckCircle2,
   CloudDownload,
   ExternalLink,
@@ -24,7 +25,7 @@ import { ActivityIndicator, Alert, Linking, Pressable, Text, TextInput, useWindo
 
 import { StructuredDataView } from '@/src/components/structured-form';
 import { ProviderIcon } from '@/src/components/provider-icon';
-import { EmptyState, ErrorState, Page, Panel, SectionHeader } from '@/src/components/ui';
+import { AppSwitch, EmptyState, ErrorState, Page, Panel, SectionHeader } from '@/src/components/ui';
 import { accountImportProviderKey, oauthPollPayload, oauthStartPayload, oauthSubmitPayload } from '@/src/lib/account-oauth';
 import { apiJson, firstArray } from '@/src/lib/api';
 import { documentMultipartBody } from '@/src/lib/file-transfer';
@@ -40,6 +41,9 @@ type Provider = {
   color: string;
   methods: Method[];
   group: 'oauth' | 'credential';
+  account?: ApiRecord;
+  fields?: ApiRecord[];
+  discovered?: boolean;
 };
 type QueryRecord = Record<string, string | number | boolean | null | undefined>;
 type FlowCall = { action: 'start' | 'poll' | 'submit' | 'direct'; path: string; method: 'GET' | 'POST'; body?: ApiRecord; query?: QueryRecord };
@@ -48,7 +52,7 @@ function routeParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
 
-const providers: Provider[] = [
+const fallbackProviders: Provider[] = [
   { key: 'anthropic', label: 'Claude', mark: 'C', color: '#d97757', methods: ['oauth', 'token'], group: 'oauth' },
   { key: 'openai', label: 'OpenAI', mark: 'O', color: '#111827', methods: ['oauth', 'api_key'], group: 'oauth' },
   { key: 'antigravity', label: 'Antigravity', mark: 'A', color: '#5b6cff', methods: ['oauth', 'token'], group: 'oauth' },
@@ -95,6 +99,55 @@ function customProvider(item: ApiRecord, index: number): Provider | undefined {
   };
 }
 
+function recordValue(value: unknown): ApiRecord {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as ApiRecord : {};
+}
+
+function stringValue(value: unknown) {
+  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+}
+
+function localizedText(value: unknown) {
+  if (typeof value === 'string' || typeof value === 'number') return String(value).trim();
+  const record = recordValue(value);
+  return String(record['zh-CN'] ?? record.zh ?? record.en ?? Object.values(record).find((entry) => typeof entry === 'string') ?? '').trim();
+}
+
+function providerFromDefinition(item: ApiRecord, index: number): Provider | undefined {
+  const key = String(item.name ?? item.provider ?? item.id ?? '').trim();
+  if (!key) return undefined;
+  const account = recordValue(item.account);
+  const fields = Array.isArray(account.fields) ? account.fields.filter((field): field is ApiRecord => Boolean(field) && typeof field === 'object' && !Array.isArray(field)) : [];
+  const flow = String(account.flow ?? (item.supports_oauth ? 'oauth' : 'form')).toLowerCase();
+  const methods: Method[] = flow === 'form' ? ['api_key'] : fields.length ? ['oauth', 'token'] : ['oauth'];
+  const label = String(item.display_name ?? item.label ?? item.name ?? key).trim();
+  let hash = 0;
+  for (const character of key) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return {
+    key,
+    label,
+    mark: Array.from(label)[0]?.toUpperCase() ?? 'P',
+    color: customProviderColors[(hash + index) % customProviderColors.length],
+    methods,
+    group: flow === 'form' ? 'credential' : 'oauth',
+    account,
+    fields,
+    discovered: true,
+  };
+}
+
+function pluginProviderDefinitions(payload: unknown) {
+  const entries = firstArray<ApiRecord>(payload, ['plugins', 'items', 'data', 'list']);
+  return entries.flatMap((entry) => {
+    if (entry.revoked_at || entry.active === false || entry.activation_state === 'inactive') return [];
+    const manifest = recordValue(entry.manifest ?? entry);
+    const provides = recordValue(manifest.provides);
+    return Array.isArray(provides.providers)
+      ? provides.providers.filter((provider): provider is ApiRecord => Boolean(provider) && typeof provider === 'object' && !Array.isArray(provider))
+      : [];
+  });
+}
+
 function nestedString(value: unknown, keys: string[]): string {
   if (!value || typeof value !== 'object') return '';
   const record = value as ApiRecord;
@@ -121,6 +174,16 @@ function nestedRecords(value: unknown, keys: string[]): ApiRecord[] {
     if (found.length) return found;
   }
   return [];
+}
+
+function completedAccountId(value: unknown) {
+  const root = recordValue(value);
+  const data = recordValue(root.data);
+  const account = recordValue(root.account ?? data.account);
+  const id = stringValue(account.id ?? account.account_id);
+  if (id) return id;
+  const status = stringValue(root.status ?? data.status).toLowerCase();
+  return status === 'completed' || status === 'active' ? stringValue(root.account_id ?? data.account_id) : '';
 }
 
 function ProviderMark({ provider, size = 42 }: { provider: Provider; size?: number }) {
@@ -150,14 +213,20 @@ function CredentialField({ label, value, onChangeText, secure = false, placehold
 export default function AdminAccountImportScreen() {
   const colors = useAppTheme();
   const { width } = useWindowDimensions();
-  const params = useLocalSearchParams<{ proxy_id?: string | string[] }>();
+  const params = useLocalSearchParams<{ proxy_id?: string | string[]; provider?: string | string[] }>();
   const requestedProxyId = routeParam(params.proxy_id).trim();
+  const requestedProvider = routeParam(params.provider).trim().toLowerCase();
   const cardBasis: `${number}%` = width >= 760 ? '22%' : width >= 390 ? '47%' : '100%';
   const [selected, setSelected] = useState<Provider>();
   const [method, setMethod] = useState<Method>('oauth');
   const [proxyId, setProxyId] = useState(requestedProxyId);
   const [label, setLabel] = useState('');
+  const [priority, setPriority] = useState('0');
+  const [wsEnabled, setWsEnabled] = useState(false);
+  const [restrictModels, setRestrictModels] = useState(false);
+  const [modelAllowlist, setModelAllowlist] = useState<string[]>([]);
   const [secret, setSecret] = useState('');
+  const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [sessionId, setSessionId] = useState('');
   const [callbackUrl, setCallbackUrl] = useState('');
   const [result, setResult] = useState<unknown>();
@@ -183,11 +252,32 @@ export default function AdminAccountImportScreen() {
     },
     retry: 0,
   });
+  const builtinProviders = useQuery({
+    queryKey: ['admin', 'providers', 'builtin', 'account-options'],
+    queryFn: async ({ signal }) => firstArray<ApiRecord>(await apiJson<unknown>('/admin/providers/builtin', { signal }), ['providers', 'items', 'data', 'list']),
+    retry: 0,
+  });
+  const integrationPlugins = useQuery({
+    queryKey: ['admin', 'plugins', 'integration', 'account-options'],
+    queryFn: ({ signal }) => apiJson<unknown>('/admin/plugins', { signal, query: { type: 'integration' } }),
+    retry: 0,
+  });
+  const candidateModels = useQuery({
+    queryKey: ['admin', 'accounts', 'candidate-models', selected?.key ?? ''],
+    queryFn: async ({ signal }) => firstArray<ApiRecord>(await apiJson<unknown>('/admin/accounts/candidate-models', { signal, query: { provider: selected?.key ?? '' } }), ['models', 'items', 'data', 'list']),
+    enabled: Boolean(selected?.key),
+    retry: 0,
+  });
 
   const flow = useMutation({
     mutationFn: ({ path, method: httpMethod, body, query }: FlowCall) => apiJson<ApiRecord>(path, { method: httpMethod, body: httpMethod === 'POST' ? JSON.stringify(body ?? {}) : undefined, query, timeoutMs: 60000 }),
     onSuccess: (payload, variables) => {
       setResult(payload);
+      const accountId = completedAccountId(payload);
+      if (accountId && restrictModels && modelAllowlist.length) {
+        void apiJson(`/admin/accounts/${encodeURIComponent(accountId)}`, { method: 'PUT', body: JSON.stringify({ model_allowlist: modelAllowlist }) })
+          .catch((error) => Alert.alert('模型范围保存失败', error instanceof Error ? error.message : '请求失败'));
+      }
       const nextSession = nestedString(payload, ['session_id', 'sessionId', 'state', 'flow_id', 'flowId']);
       if (nextSession) setSessionId(nextSession);
       if (variables.action === 'start') {
@@ -219,7 +309,12 @@ export default function AdminAccountImportScreen() {
     setSelected(provider);
     setMethod(provider.methods[0]);
     setLabel('');
+    setPriority('0');
+    setWsEnabled(false);
+    setRestrictModels(false);
+    setModelAllowlist([]);
     setSecret('');
+    setCredentials(Object.fromEntries((provider.fields ?? []).map((field) => [String(field.name ?? ''), '']).filter(([key]) => Boolean(key))));
     setSessionId('');
     setCallbackUrl('');
     setResult(undefined);
@@ -228,38 +323,48 @@ export default function AdminAccountImportScreen() {
 
   function startFlow() {
     if (!selected) return;
-    if (selected.key === 'kiro') {
+    if (selected.key === 'kiro' && !selected.discovered) {
       if (method === 'oauth') return flow.mutate({ action: 'start', path: '/admin/accounts/oauth/kiro/start', method: 'POST', body: proxyPayload });
       if (method === 'sso') return flow.mutate({ action: 'start', path: '/admin/accounts/kiro/sso/start', method: 'POST', body: proxyPayload });
       if (method === 'iam') return flow.mutate({ action: 'start', path: '/admin/accounts/kiro/iam-sso/start', method: 'POST', body: proxyPayload });
     }
-    const provider = accountImportProviderKey(selected.key);
+    const provider = selected.discovered ? selected.key : accountImportProviderKey(selected.key);
     flow.mutate({ action: 'start', path: `/admin/accounts/oauth/${encodeURIComponent(provider)}/start`, method: 'POST', body: proxyPayload });
   }
 
   function pollFlow() {
     if (!selected) return;
     const body = oauthPollPayload(sessionId);
-    if (selected.key === 'kiro' && method === 'oauth') return flow.mutate({ action: 'poll', path: '/admin/accounts/oauth/kiro/poll', method: 'POST', body });
-    if (selected.key === 'kiro' && method === 'sso') return flow.mutate({ action: 'poll', path: '/admin/accounts/kiro/sso/poll', method: 'POST', body });
-    const provider = accountImportProviderKey(selected.key);
+    if (selected.key === 'kiro' && !selected.discovered && method === 'oauth') return flow.mutate({ action: 'poll', path: '/admin/accounts/oauth/kiro/poll', method: 'POST', body });
+    if (selected.key === 'kiro' && !selected.discovered && method === 'sso') return flow.mutate({ action: 'poll', path: '/admin/accounts/kiro/sso/poll', method: 'POST', body });
+    const provider = selected.discovered ? selected.key : accountImportProviderKey(selected.key);
     flow.mutate({ action: 'poll', path: `/admin/accounts/oauth/${encodeURIComponent(provider)}/poll`, method: 'POST', body });
   }
 
   function submitFlow() {
     if (!selected) return;
     const body = oauthSubmitPayload({ proxyId, sessionId, callbackUrl });
-    if (selected.key === 'kiro' && method === 'sso') return flow.mutate({ action: 'submit', path: '/admin/accounts/kiro/sso/submit', method: 'POST', body });
-    if (selected.key === 'kiro' && method === 'iam') return flow.mutate({ action: 'submit', path: '/admin/accounts/kiro/iam-sso/complete', method: 'POST', body });
-    const provider = accountImportProviderKey(selected.key);
+    if (selected.key === 'kiro' && !selected.discovered && method === 'sso') return flow.mutate({ action: 'submit', path: '/admin/accounts/kiro/sso/submit', method: 'POST', body });
+    if (selected.key === 'kiro' && !selected.discovered && method === 'iam') return flow.mutate({ action: 'submit', path: '/admin/accounts/kiro/iam-sso/complete', method: 'POST', body });
+    const provider = selected.discovered ? selected.key : accountImportProviderKey(selected.key);
     flow.mutate({ action: 'submit', path: `/admin/accounts/oauth/${encodeURIComponent(provider)}/submit`, method: 'POST', body });
   }
 
   function submitCredential() {
-    if (!selected || !secret.trim()) return;
+    if (!selected) return;
+    const providerCredentials = Object.fromEntries(Object.entries(credentials).map(([key, value]) => [key, value.trim()]).filter(([key, value]) => Boolean(key && value)));
+    const missing = (selected.fields ?? []).filter((field) => field.required && !providerCredentials[String(field.name ?? '')]);
+    if (missing.length) {
+      Alert.alert('请补全凭据', `还需要填写：${missing.map((field) => localizedText(field.label) || String(field.name ?? '')).join('、')}`);
+      return;
+    }
+    if (!selected.fields?.length && !secret.trim()) return;
     const field = method === 'api_key' ? 'api_key' : 'token';
-    const body: ApiRecord = { ...proxyPayload, provider: accountImportProviderKey(selected.key), label: label.trim() || selected.label, [field]: secret.trim(), enabled: true };
-    if (selected.key === 'kiro') {
+    const modelScope = restrictModels && modelAllowlist.length ? { model_allowlist: modelAllowlist } : {};
+    const body: ApiRecord = selected.discovered
+      ? { ...proxyPayload, ...modelScope, provider: selected.key, label: label.trim() || undefined, credentials: providerCredentials, priority: Number(priority) || 0, ws_enabled: wsEnabled || undefined, enabled: true }
+      : { ...proxyPayload, ...modelScope, provider: accountImportProviderKey(selected.key), label: label.trim() || selected.label, [field]: secret.trim(), priority: Number(priority) || 0, ws_enabled: wsEnabled || undefined, enabled: true };
+    if (selected.key === 'kiro' && !selected.discovered) {
       const path = method === 'api_key' ? '/admin/accounts/kiro/api-key' : '/admin/accounts/kiro/sso-token';
       return flow.mutate({ action: 'direct', path, method: 'POST', body });
     }
@@ -281,15 +386,43 @@ export default function AdminAccountImportScreen() {
     const provider = customProvider(item, index);
     return provider ? [provider] : [];
   }), [providerOptions.data]);
-  const oauthProviders = providers.filter((provider) => provider.group === 'oauth');
-  const credentialProviders = providers.filter((provider) => provider.group === 'credential');
+  const discoveredProviders = useMemo(() => {
+    const definitions = [...(builtinProviders.data ?? []), ...pluginProviderDefinitions(integrationPlugins.data)];
+    const unique = new Map<string, Provider>();
+    definitions.forEach((item, index) => {
+      const provider = providerFromDefinition(item, index);
+      if (provider && !unique.has(provider.key)) unique.set(provider.key, provider);
+    });
+    return [...unique.values()];
+  }, [builtinProviders.data, integrationPlugins.data]);
+  const providerDiscoveryLoading = builtinProviders.isLoading || integrationPlugins.isLoading;
+  const providerCatalog = discoveredProviders.length ? discoveredProviders : providerDiscoveryLoading ? [] : fallbackProviders;
+  const oauthProviders = providerCatalog.filter((provider) => provider.group === 'oauth');
+  const credentialProviders = providerCatalog.filter((provider) => provider.group === 'credential');
   const oauthMethod = method === 'oauth' || method === 'sso' || method === 'iam';
+  const dynamicCredentialReady = Boolean(selected?.fields?.length)
+    ? (selected?.fields ?? []).every((field) => !field.required || Boolean(credentials[String(field.name ?? '')]?.trim()))
+    : Boolean(secret.trim());
+  const candidateIds = useMemo(() => (candidateModels.data ?? []).map((item) => String(item.id ?? item.model ?? item.name ?? '')).filter(Boolean), [candidateModels.data]);
+  const modelScopeReady = !restrictModels || modelAllowlist.length > 0;
 
-  return <Page title={selected ? `接入 ${selected.label}` : '选择提供商'} subtitle={selected ? '选择接入方式并完成授权' : '添加一个新的上游账号'} icon={selected ? KeyRound : CloudDownload} safeTop={false} contentMaxWidth={920} refreshing={flow.isPending || fileImport.isPending || providerOptions.isFetching || proxies.isFetching} onRefresh={() => { void providerOptions.refetch(); void proxies.refetch(); }}>
+  function toggleCandidateModel(model: string) {
+    setModelAllowlist((current) => current.includes(model) ? current.filter((value) => value !== model) : [...current, model]);
+  }
+
+  useEffect(() => {
+    if (!requestedProvider || selected || builtinProviders.isFetching || integrationPlugins.isFetching) return;
+    const provider = providerCatalog.find((item) => item.key.toLowerCase() === requestedProvider || accountImportProviderKey(item.key) === requestedProvider);
+    if (provider) chooseProvider(provider);
+  }, [builtinProviders.isFetching, integrationPlugins.isFetching, providerCatalog, requestedProvider, selected]);
+
+  return <Page title={selected ? `接入 ${selected.label}` : '选择提供商'} subtitle={selected ? '选择接入方式并完成授权' : '添加一个新的上游账号'} icon={selected ? KeyRound : CloudDownload} safeTop={false} contentMaxWidth={920} refreshing={flow.isPending || fileImport.isPending || providerOptions.isFetching || builtinProviders.isFetching || integrationPlugins.isFetching || candidateModels.isFetching || proxies.isFetching} onRefresh={() => { void providerOptions.refetch(); void builtinProviders.refetch(); void integrationPlugins.refetch(); void candidateModels.refetch(); void proxies.refetch(); }}>
     {selected ? <Pressable onPress={() => setSelected(undefined)} style={{ alignSelf: 'flex-start', minHeight: 38, paddingHorizontal: 11, borderRadius: 12, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card, flexDirection: 'row', alignItems: 'center', gap: 6 }}><ArrowLeft color={colors.text} size={16} /><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>重新选择</Text></Pressable> : null}
 
     {!selected ? <>
-      <View style={{ gap: 10 }}>
+      {providerDiscoveryLoading ? <View style={{ minHeight: 96, alignItems: 'center', justifyContent: 'center', gap: 8 }}><ActivityIndicator color={colors.primary} /><Text style={{ color: colors.subtext, fontSize: 11 }}>正在读取已安装的供应商…</Text></View> : null}
+      {(builtinProviders.error || integrationPlugins.error) ? <Text style={{ color: colors.warning, fontSize: 11, lineHeight: 15 }}>动态供应商目录加载失败，当前使用兼容目录；下拉刷新可重试。</Text> : null}
+      {!providerDiscoveryLoading ? <><View style={{ gap: 10 }}>
         <SectionHeader icon={Link2} title="一键登录" />
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }}>{oauthProviders.map((provider) => <ProviderCard key={provider.key} provider={provider} basis={cardBasis} onPress={() => chooseProvider(provider)} />)}</View>
       </View>
@@ -311,7 +444,7 @@ export default function AdminAccountImportScreen() {
           <Pressable disabled={fileImport.isPending} onPress={() => fileImport.mutate({ asset: file, dryRun: true })} style={{ flex: 1, minHeight: 44, borderRadius: 12, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' }}><Text style={{ color: colors.primary, fontWeight: '800', fontSize: 11 }}>先检查文件</Text></Pressable>
           <Pressable disabled={fileImport.isPending} onPress={() => fileImport.mutate({ asset: file, dryRun: false })} style={{ flex: 1, minHeight: 44, borderRadius: 12, backgroundColor: colors.primary, alignItems: 'center', justifyContent: 'center' }}><Text style={{ color: '#fff', fontWeight: '800', fontSize: 11 }}>正式导入</Text></Pressable>
         </View> : null}
-      </Panel>
+      </Panel></> : null}
     </> : <>
       <View style={{ minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: 12 }}><ProviderMark provider={selected} size={50} /><View style={{ flex: 1 }}><Text style={{ color: colors.text, fontSize: 18, fontWeight: '800' }}>{selected.label}</Text><Text style={{ color: colors.subtext, fontSize: 11, marginTop: 3 }}>{methodLabels[method]}</Text></View></View>
 
@@ -327,20 +460,33 @@ export default function AdminAccountImportScreen() {
         </View>
       </Panel>
 
+      <Panel>
+        <SectionHeader icon={Boxes} title="模型范围" meta={restrictModels ? `已选 ${modelAllowlist.length}` : '全部模型'} />
+        <View style={{ minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 8 }}><View style={{ flex: 1 }}><Text style={{ color: colors.text, fontSize: 11, fontWeight: '700' }}>限制该账号可用模型</Text><Text style={{ color: colors.subtext, fontSize: 11, marginTop: 2 }}>关闭时允许该提供商的全部模型</Text></View><AppSwitch accessibilityLabel="限制可用模型" value={restrictModels} onValueChange={(value) => { setRestrictModels(value); if (value && !modelAllowlist.length && candidateIds.length <= 12) setModelAllowlist(candidateIds); }} /></View>
+        {restrictModels ? candidateModels.isLoading ? <ActivityIndicator color={colors.primary} /> : candidateModels.error ? <ErrorState message={candidateModels.error.message} retry={() => candidateModels.refetch()} /> : candidateIds.length ? <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>{candidateIds.map((model) => { const active = modelAllowlist.includes(model); return <Pressable key={model} onPress={() => toggleCandidateModel(model)} style={{ maxWidth: '100%', minHeight: 34, paddingHorizontal: 9, borderRadius: 10, borderWidth: 1, borderColor: active ? colors.primary : colors.border, backgroundColor: active ? colors.primarySoft : colors.card, justifyContent: 'center' }}><Text numberOfLines={1} style={{ color: active ? colors.primary : colors.subtext, fontSize: 11, fontFamily: 'monospace' }}>{model}</Text></Pressable>; })}</View> : <Text style={{ color: colors.subtext, fontSize: 11 }}>服务端暂未返回候选模型，可在账号创建后配置。</Text> : null}
+        {restrictModels && !modelScopeReady ? <Text style={{ color: colors.danger, fontSize: 11 }}>请至少选择一个模型。</Text> : null}
+      </Panel>
+
       {oauthMethod ? <Panel>
         <SectionHeader icon={ShieldCheck} title={methodLabels[method]} />
         {sessionId ? <CredentialField label="授权会话" value={sessionId} onChangeText={setSessionId} placeholder="自动获取" /> : null}
         {(sessionId || result !== undefined) && authUrl ? <CredentialField label="授权回调地址（按需填写）" value={callbackUrl} onChangeText={setCallbackUrl} placeholder="粘贴浏览器授权完成后的完整回调地址" /> : null}
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-          <Pressable disabled={flow.isPending} onPress={startFlow} style={{ flexGrow: 1, minHeight: 44, paddingHorizontal: 13, borderRadius: 12, backgroundColor: colors.primary, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>{flow.isPending ? <ActivityIndicator color="#fff" /> : <Play color="#fff" size={15} />}<Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>开始授权</Text></Pressable>
+          <Pressable disabled={flow.isPending || !modelScopeReady} onPress={startFlow} style={{ flexGrow: 1, minHeight: 44, paddingHorizontal: 13, borderRadius: 12, backgroundColor: modelScopeReady ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>{flow.isPending ? <ActivityIndicator color="#fff" /> : <Play color="#fff" size={15} />}<Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>开始授权</Text></Pressable>
           {method !== 'iam' ? <Pressable disabled={flow.isPending || !result} onPress={pollFlow} style={{ flexGrow: 1, minHeight: 44, paddingHorizontal: 13, borderRadius: 12, borderWidth: 1, borderColor: colors.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, opacity: result ? 1 : 0.45 }}><RefreshCw color={colors.primary} size={15} /><Text style={{ color: colors.primary, fontSize: 11, fontWeight: '800' }}>检查状态</Text></Pressable> : null}
           <Pressable disabled={flow.isPending || !result} onPress={submitFlow} style={{ flexGrow: 1, minHeight: 44, paddingHorizontal: 13, borderRadius: 12, borderWidth: 1, borderColor: colors.border, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, opacity: result ? 1 : 0.45 }}><Send color={colors.primary} size={15} /><Text style={{ color: colors.primary, fontSize: 11, fontWeight: '800' }}>{method === 'iam' ? '完成接入' : '提交授权'}</Text></Pressable>
         </View>
       </Panel> : <Panel>
         <SectionHeader icon={KeyRound} title={methodLabels[method]} />
         <CredentialField label="账号名称（可选）" value={label} onChangeText={setLabel} placeholder={selected.label} />
-        <CredentialField label={method === 'api_key' ? 'API Key' : 'Token'} value={secret} onChangeText={setSecret} secure placeholder="粘贴凭据" />
-        <Pressable disabled={flow.isPending || !secret.trim()} onPress={submitCredential} style={{ minHeight: 46, borderRadius: 12, backgroundColor: secret.trim() ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }}>{flow.isPending ? <ActivityIndicator color="#fff" /> : <KeyRound color="#fff" size={16} />}<Text style={{ color: '#fff', fontWeight: '800' }}>添加账号</Text></Pressable>
+        <CredentialField label="优先级" value={priority} onChangeText={setPriority} placeholder="0" />
+        {selected.fields?.length ? selected.fields.map((field) => {
+          const name = String(field.name ?? '');
+          if (!name) return null;
+          return <CredentialField key={name} label={`${localizedText(field.label) || name}${field.required ? '' : '（可选）'}`} value={credentials[name] ?? ''} onChangeText={(value) => setCredentials((current) => ({ ...current, [name]: value }))} secure={field.type === 'password' || field.secret === true} placeholder={stringValue(field.placeholder)} />;
+        }) : <CredentialField label={method === 'api_key' ? 'API Key' : 'Token'} value={secret} onChangeText={setSecret} secure placeholder="粘贴凭据" />}
+        {recordValue(selected.account).controls && Array.isArray(recordValue(selected.account).controls) && (recordValue(selected.account).controls as unknown[]).some((control) => recordValue(control).key === 'ws_enabled') ? <View style={{ minHeight: 46, flexDirection: 'row', alignItems: 'center', gap: 8 }}><Text style={{ flex: 1, color: colors.text, fontSize: 11, fontWeight: '700' }}>允许 WebSocket 会话</Text><AppSwitch accessibilityLabel="WebSocket" value={wsEnabled} onValueChange={setWsEnabled} /></View> : null}
+        <Pressable disabled={flow.isPending || !dynamicCredentialReady || !modelScopeReady} onPress={submitCredential} style={{ minHeight: 46, borderRadius: 12, backgroundColor: dynamicCredentialReady && modelScopeReady ? colors.primary : colors.disabled, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 }}>{flow.isPending ? <ActivityIndicator color="#fff" /> : <KeyRound color="#fff" size={16} />}<Text style={{ color: '#fff', fontWeight: '800' }}>添加账号</Text></Pressable>
       </Panel>}
     </>}
 
