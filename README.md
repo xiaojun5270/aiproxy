@@ -27,6 +27,8 @@ npm run check:endpoints
 npm run verify
 ```
 
+原生打包前的版本、接口、类型与测试检查使用 `npm run verify:build`。GitHub Android / iOS 流水线将 `npm audit` 单独执行并上传 JSON 报告，在构建摘要和警告中展示漏洞数量；审计结果不阻断原生编译。严格的 `npm run verify` 仍会在发现依赖漏洞时返回失败。
+
 ## 项目文档
 
 - [开发历程](docs/DEVELOPMENT_HISTORY.md)：记录产品里程碑、工程架构、质量基线和发布规范

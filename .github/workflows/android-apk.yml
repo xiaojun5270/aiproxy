@@ -44,6 +44,8 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -59,8 +61,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify endpoint coverage, types, and dependencies
-        run: npm run verify
+      - name: Verify version, endpoint coverage, types, and tests
+        run: npm run verify:build
+
+      - name: Audit dependencies
+        id: dependency_audit
+        continue-on-error: true
+        run: |
+          mkdir -p artifacts/diagnostics
+          npm audit --audit-level=low --json > artifacts/diagnostics/npm-audit.json
+
+      - name: Report dependency audit
+        if: always() && (steps.dependency_audit.outcome == 'success' || steps.dependency_audit.outcome == 'failure')
+        run: node scripts/report-dependency-audit.mjs artifacts/diagnostics/npm-audit.json
+
+      - name: Upload dependency audit
+        if: always() && (steps.dependency_audit.outcome == 'success' || steps.dependency_audit.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI Proxy Android dependency audit
+          path: artifacts/diagnostics/npm-audit.json
+          if-no-files-found: warn
 
       - name: Generate Android project
         run: npx expo prebuild --platform android --clean
